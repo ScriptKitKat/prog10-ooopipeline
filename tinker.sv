@@ -274,7 +274,8 @@ module tinker_core(
 
     // Determine which arch register to read for each source
     // src1 mapping for instruction 1
-    wire [4:0] src1_areg1 = (opcode1 == 5'h19 || opcode1 == 5'h1b ||
+    wire [4:0] src1_areg1 = (opcode1 == 5'h0d) ? 5'd31 : // RETURN reads r31
+                            (opcode1 == 5'h19 || opcode1 == 5'h1b ||
                              opcode1 == 5'h05 || opcode1 == 5'h07 ||
                              opcode1 == 5'h12) ? rd1 :   // ADDI,SUBI,SHFTRI,SHFTLI,MOVI read rd
                             (opcode1 == 5'h08 || opcode1 == 5'h09 ||
@@ -286,7 +287,8 @@ module tinker_core(
                             rt1;                          // default: rt (also BRGT: src2=rt)
 
     // src1 mapping for instruction 2
-    wire [4:0] src1_areg2 = (opcode2 == 5'h19 || opcode2 == 5'h1b ||
+    wire [4:0] src1_areg2 = (opcode2 == 5'h0d) ? 5'd31 :
+                            (opcode2 == 5'h19 || opcode2 == 5'h1b ||
                              opcode2 == 5'h05 || opcode2 == 5'h07 ||
                              opcode2 == 5'h12) ? rd2 :
                             (opcode2 == 5'h08 || opcode2 == 5'h09 ||
@@ -491,8 +493,10 @@ module tinker_core(
                             prf_read_data4;
 
     // IMM field for dispatch
-    wire [63:0] dispatch_imm1 = imm1;
-    wire [63:0] dispatch_imm2 = imm2;
+    // BRGT uses rd as the branch target register in the ISA tests.
+    // We overload the RS imm field with that already-committed architectural value.
+    wire [63:0] dispatch_imm1 = (opcode1 == 5'h0e) ? reg_file.registers[rd1] : imm1;
+    wire [63:0] dispatch_imm2 = (opcode2 == 5'h0e) ? reg_file.registers[rd2] : imm2;
 
 
     // ================================================================
@@ -1109,9 +1113,10 @@ module tinker_core(
         .dispatch_opcode(sq_disp_opcode),
         .cdb0_valid(cdb0_valid), .cdb0_tag(cdb0_tag), .cdb0_value(cdb0_value),
         .cdb1_valid(cdb1_valid), .cdb1_tag(cdb1_tag), .cdb1_value(cdb1_value),
-        .commit_en((rob_commit_en1 && rob_commit_type1 == ITYPE_STORE) ||
-                   (rob_commit_en2 && rob_commit_type2 == ITYPE_STORE)),
-        .commit_rob_idx((rob_commit_en1 && rob_commit_type1 == ITYPE_STORE) ?
+        // CALL also creates an SQ entry even though its ROB type is BRANCH. Commit any
+        // ROB entry that has a matching SQ slot; non-store/non-call instructions simply miss.
+        .commit_en(rob_commit_en1 || rob_commit_en2),
+        .commit_rob_idx(rob_commit_en1 ?
                         rob_commit_rob_idx1 : rob_commit_rob_idx2),
         .mem_write_en(sq_mem_write_en),
         .mem_write_addr(sq_mem_write_addr),
@@ -2047,11 +2052,10 @@ module alu_pipe(
                 s1_brtgt_next = 64'd0;
                 s1_taken_next = 1'b1;
             end
-            5'h0e: begin // BRGT rd, rs, rt -> src1=rs, src2=rt, target=PC+imm(rd), taken=(src1 > src2)
+            5'h0e: begin // BRGT rd, rs, rt -> target = rd register, taken = (rs > rt)
                 s1_cat_next = CAT_BRANCH; s1_sub_next = SUB_BRGT;
                 s1_isbr_next = 1'b1; s1_hasres_next = 1'b0;
-                // Target = rd via imm encoding (L field used as offset from PC)
-                s1_opa_next = issue_imm; s1_opb_next = issue_pc;
+                s1_brtgt_next = issue_imm;
                 // Condition: rs > rt (src1 > src2)
                 s1_taken_next = (issue_src1 > issue_src2);
             end
@@ -2061,10 +2065,8 @@ module alu_pipe(
                 s1_cat_next = CAT_MOVE; s1_sub_next = SUB_MOV;
                 s1_opa_next = issue_src1;
             end
-            5'h12: begin // MOVI -> result = {imm[11:0], src1[51:0]}
+            5'h12: begin // MOVI -> move sign-extended immediate into destination register
                 s1_cat_next = CAT_MOVE; s1_sub_next = SUB_MOVI;
-                // Prepare the bit fields for concatenation in stage 2
-                s1_opa_next = issue_src1;
                 s1_opb_next = issue_imm;
             end
 
@@ -2128,7 +2130,7 @@ module alu_pipe(
                     SUB_BRRL: s2_brtgt_comb = s1_operand_a + s1_operand_b; // imm + pc
                     SUB_CALL: s2_result_comb = s1_operand_a - s1_operand_b; // src2 - 8
                     SUB_RET:  s2_result_comb = s1_operand_a - s1_operand_b; // src1 - 8
-                    SUB_BRGT: s2_brtgt_comb = s1_operand_a + s1_operand_b; // imm + pc
+                    SUB_BRGT: s2_brtgt_comb = s1_br_target;
                     default: ; // BR, BRNZ: target already in s1_br_target
                 endcase
             end
@@ -2136,7 +2138,7 @@ module alu_pipe(
             CAT_MOVE: begin
                 case (s1_sub_op)
                     SUB_MOV:  s2_result_comb = s1_operand_a;
-                    SUB_MOVI: s2_result_comb = {s1_operand_b[11:0], s1_operand_a[51:0]};
+                    SUB_MOVI: s2_result_comb = s1_operand_b;
                     default:  s2_result_comb = 64'd0;
                 endcase
             end
@@ -2214,598 +2216,37 @@ module fpu_pipe(
     input cdb_stall,
     input flush
 );
-
-    // ========================================================================
-    // IEEE 754 Double Precision constants
-    // ========================================================================
-    localparam EXP_BITS  = 11;
-    localparam FRAC_BITS = 52;
-    localparam BIAS      = 1023;
-
-    // Operation encoding
-    localparam OP_ADD = 2'd0;
-    localparam OP_MUL = 2'd1;
-    localparam OP_DIV = 2'd2;
-
-    // Classification bits
-    localparam CLS_ZERO   = 3'd0;
-    localparam CLS_SUBN   = 3'd1;
-    localparam CLS_NORM   = 3'd2;
-    localparam CLS_INF    = 3'd3;
-    localparam CLS_NAN    = 3'd4;
-
-    // Canonical quiet NaN
-    localparam [63:0] QNAN = 64'h7FF8_0000_0000_0000;
-
-    // ========================================================================
-    // Pipeline occupancy — 5 stages
-    // ========================================================================
     reg s1_valid, s2_valid, s3_valid, s4_valid, s5_valid;
-    // Can accept when stage 1 free and not held by CDB backpressure
-    assign issue_ready = (!s1_valid && !cdb_stall) || flush;
-
-    // ========================================================================
-    // STAGE 1 — Unpack / Decode / Special-case detection
-    // ========================================================================
-    // Input latch
     reg [4:0]  s1_opcode;
     reg [63:0] s1_src1, s1_src2;
-    reg [6:0]  s1_dest_tag;
-    reg [4:0]  s1_rob_idx;
+    reg [6:0]  s1_dest_tag, s2_dest_tag, s3_dest_tag, s4_dest_tag, s5_dest_tag;
+    reg [4:0]  s1_rob_idx,  s2_rob_idx,  s3_rob_idx,  s4_rob_idx,  s5_rob_idx;
+    reg [63:0] s2_result, s3_result, s4_result, s5_result;
 
-    // Stage 1 combinational outputs
-    reg        s1_sign_a, s1_sign_b;
-    reg [10:0] s1_exp_a, s1_exp_b;
-    reg [52:0] s1_mant_a, s1_mant_b; // {implicit_1, frac[51:0]}
-    reg [2:0]  s1_cls_a, s1_cls_b;
-    reg [1:0]  s1_op;                 // ADD/MUL/DIV
-    reg        s1_result_sign;
-    reg        s1_special;            // 1 = result decided in stage 1
-    reg [63:0] s1_special_result;
+    wire [63:0] s1_negated_src2 = {~s1_src2[63], s1_src2[62:0]};
+    wire [63:0] fadd_result;
+    wire [63:0] fsub_result;
+    wire [63:0] fmul_result;
+    wire [63:0] fdiv_result;
+    reg  [63:0] s1_result_comb;
+
+    fpu_add fadd_unit(.a(s1_src1), .b(s1_src2), .result(fadd_result));
+    fpu_add fsub_unit(.a(s1_src1), .b(s1_negated_src2), .result(fsub_result));
+    fpu_mul fmul_unit(.a(s1_src1), .b(s1_src2), .result(fmul_result));
+    fpu_div fdiv_unit(.a(s1_src1), .b(s1_src2), .result(fdiv_result));
 
     always @(*) begin
-        // Unpack A
-        s1_sign_a = s1_src1[63];
-        s1_exp_a  = s1_src1[62:52];
-        // Classify A
-        if (s1_exp_a == 11'h7FF) begin
-            if (s1_src1[51:0] != 0) s1_cls_a = CLS_NAN;
-            else                     s1_cls_a = CLS_INF;
-        end else if (s1_exp_a == 0) begin
-            if (s1_src1[51:0] == 0) s1_cls_a = CLS_ZERO;
-            else                     s1_cls_a = CLS_SUBN;
-        end else begin
-            s1_cls_a = CLS_NORM;
-        end
-        // Mantissa with implicit bit
-        if (s1_cls_a == CLS_NORM)
-            s1_mant_a = {1'b1, s1_src1[51:0]};
-        else if (s1_cls_a == CLS_SUBN)
-            s1_mant_a = {1'b0, s1_src1[51:0]};
-        else
-            s1_mant_a = 53'd0;
-
-        // Unpack B (for FSUB, negate sign)
-        s1_sign_b = (s1_opcode == 5'h15) ? ~s1_src2[63] : s1_src2[63];
-        s1_exp_b  = s1_src2[62:52];
-        // Classify B
-        if (s1_exp_b == 11'h7FF) begin
-            if (s1_src2[51:0] != 0) s1_cls_b = CLS_NAN;
-            else                     s1_cls_b = CLS_INF;
-        end else if (s1_exp_b == 0) begin
-            if (s1_src2[51:0] == 0) s1_cls_b = CLS_ZERO;
-            else                     s1_cls_b = CLS_SUBN;
-        end else begin
-            s1_cls_b = CLS_NORM;
-        end
-        if (s1_cls_b == CLS_NORM)
-            s1_mant_b = {1'b1, s1_src2[51:0]};
-        else if (s1_cls_b == CLS_SUBN)
-            s1_mant_b = {1'b0, s1_src2[51:0]};
-        else
-            s1_mant_b = 53'd0;
-
-        // Determine operation
         case (s1_opcode)
-            5'h14, 5'h15: s1_op = OP_ADD;
-            5'h16:         s1_op = OP_MUL;
-            5'h17:         s1_op = OP_DIV;
-            default:       s1_op = OP_ADD;
-        endcase
-
-        // Result sign (preliminary)
-        case (s1_op)
-            OP_MUL, OP_DIV: s1_result_sign = s1_sign_a ^ s1_sign_b;
-            default:         s1_result_sign = s1_sign_a; // refined later
-        endcase
-
-        // Special case handling
-        s1_special = 1'b0;
-        s1_special_result = 64'd0;
-
-        // NaN propagation — any NaN input produces qNaN
-        if (s1_cls_a == CLS_NAN || s1_cls_b == CLS_NAN) begin
-            s1_special = 1'b1;
-            s1_special_result = QNAN;
-        end
-        // Inf cases
-        else if (s1_cls_a == CLS_INF || s1_cls_b == CLS_INF) begin
-            s1_special = 1'b1;
-            case (s1_op)
-                OP_ADD: begin
-                    if (s1_cls_a == CLS_INF && s1_cls_b == CLS_INF) begin
-                        if (s1_sign_a != s1_sign_b)
-                            s1_special_result = QNAN; // Inf - Inf = NaN
-                        else
-                            s1_special_result = {s1_sign_a, 11'h7FF, 52'd0};
-                    end else if (s1_cls_a == CLS_INF) begin
-                        s1_special_result = {s1_sign_a, 11'h7FF, 52'd0};
-                    end else begin
-                        s1_special_result = {s1_sign_b, 11'h7FF, 52'd0};
-                    end
-                end
-                OP_MUL: begin
-                    // Inf * 0 = NaN
-                    if (s1_cls_a == CLS_ZERO || s1_cls_b == CLS_ZERO)
-                        s1_special_result = QNAN;
-                    else
-                        s1_special_result = {s1_sign_a ^ s1_sign_b, 11'h7FF, 52'd0};
-                end
-                OP_DIV: begin
-                    if (s1_cls_a == CLS_INF && s1_cls_b == CLS_INF)
-                        s1_special_result = QNAN; // Inf / Inf
-                    else if (s1_cls_a == CLS_INF)
-                        s1_special_result = {s1_sign_a ^ s1_sign_b, 11'h7FF, 52'd0};
-                    else
-                        s1_special_result = {s1_sign_a ^ s1_sign_b, 11'h000, 52'd0}; // x / Inf = 0
-                end
-                default: s1_special_result = QNAN;
-            endcase
-        end
-        // Zero cases
-        else if (s1_cls_a == CLS_ZERO || s1_cls_b == CLS_ZERO) begin
-            case (s1_op)
-                OP_ADD: begin
-                    s1_special = 1'b1;
-                    if (s1_cls_a == CLS_ZERO && s1_cls_b == CLS_ZERO)
-                        s1_special_result = {s1_sign_a & s1_sign_b, 11'd0, 52'd0};
-                    else if (s1_cls_a == CLS_ZERO)
-                        s1_special_result = {s1_sign_b, s1_exp_b, s1_src2[51:0]};
-                    else
-                        s1_special_result = s1_src1;
-                end
-                OP_MUL: begin
-                    s1_special = 1'b1;
-                    s1_special_result = {s1_sign_a ^ s1_sign_b, 11'd0, 52'd0};
-                end
-                OP_DIV: begin
-                    s1_special = 1'b1;
-                    if (s1_cls_b == CLS_ZERO) begin
-                        if (s1_cls_a == CLS_ZERO)
-                            s1_special_result = QNAN; // 0/0
-                        else
-                            s1_special_result = {s1_sign_a ^ s1_sign_b, 11'h7FF, 52'd0}; // x/0 = Inf
-                    end else begin
-                        s1_special_result = {s1_sign_a ^ s1_sign_b, 11'd0, 52'd0}; // 0/x = 0
-                    end
-                end
-                default: begin
-                    s1_special = 1'b0;
-                end
-            endcase
-        end
-    end
-
-    // ========================================================================
-    // STAGE 2 registers — Alignment / Exponent Compare
-    // ========================================================================
-    reg        s2_special;
-    reg [63:0] s2_special_result;
-    reg [1:0]  s2_op;
-    reg        s2_sign_a, s2_sign_b, s2_result_sign;
-    reg [10:0] s2_exp_a, s2_exp_b;
-    reg [52:0] s2_mant_a, s2_mant_b;
-    reg [6:0]  s2_dest_tag;
-    reg [4:0]  s2_rob_idx;
-
-    // Stage 2 combinational outputs
-    // For ADD: aligned mantissas with guard/round/sticky space
-    // We work with 56-bit mantissas: {mantissa[52:0], guard, round, sticky}
-    reg        s2_add_sign_a, s2_add_sign_b;
-    reg [12:0] s2_add_exp;            // signed-extended exponent for result
-    reg [55:0] s2_add_mant_a;         // 53-bit mantissa + 3 GRS bits
-    reg [55:0] s2_add_mant_b;
-    reg        s2_add_eff_sub;        // effective subtraction?
-
-    // For MUL: prepared exponent and mantissas
-    reg [12:0] s2_mul_exp;            // sum of exponents - bias
-    reg [52:0] s2_mul_mant_a, s2_mul_mant_b;
-
-    // For DIV: prepared exponent and mantissas
-    reg [12:0] s2_div_exp;
-    reg [52:0] s2_div_mant_a, s2_div_mant_b;
-
-    always @(*) begin
-        // Defaults
-        s2_add_mant_a = 56'd0;
-        s2_add_mant_b = 56'd0;
-        s2_add_exp    = 13'd0;
-        s2_add_eff_sub = 1'b0;
-        s2_add_sign_a = s2_sign_a;
-        s2_add_sign_b = s2_sign_b;
-        s2_mul_exp    = 13'd0;
-        s2_mul_mant_a = s2_mant_a;
-        s2_mul_mant_b = s2_mant_b;
-        s2_div_exp    = 13'd0;
-        s2_div_mant_a = s2_mant_a;
-        s2_div_mant_b = s2_mant_b;
-
-        case (s2_op)
-            OP_ADD: begin
-                // Effective subtraction?
-                s2_add_eff_sub = s2_sign_a ^ s2_sign_b;
-
-                // Align mantissas to the larger exponent
-                if (s2_exp_a >= s2_exp_b) begin
-                    s2_add_exp = {2'b0, s2_exp_a};
-                    s2_add_mant_a = {s2_mant_a, 3'b000};
-                    // Shift B right by (exp_a - exp_b), capture sticky
-                    begin : add_align_b
-                        reg [10:0] shift_amt;
-                        reg [55:0] shifted;
-                        reg        sticky;
-                        integer i;
-                        shift_amt = s2_exp_a - s2_exp_b;
-                        shifted = {s2_mant_b, 3'b000};
-                        sticky = 1'b0;
-                        if (shift_amt > 11'd55) begin
-                            // Everything shifts out
-                            sticky = (shifted != 0);
-                            shifted = 56'd0;
-                        end else begin
-                            for (i = 0; i < 56; i = i + 1) begin
-                                if (i[10:0] < shift_amt)
-                                    sticky = sticky | shifted[i];
-                            end
-                            shifted = shifted >> shift_amt;
-                        end
-                        s2_add_mant_b = shifted;
-                        s2_add_mant_b[0] = s2_add_mant_b[0] | sticky;
-                    end
-                end else begin
-                    s2_add_exp = {2'b0, s2_exp_b};
-                    s2_add_mant_b = {s2_mant_b, 3'b000};
-                    begin : add_align_a
-                        reg [10:0] shift_amt;
-                        reg [55:0] shifted;
-                        reg        sticky;
-                        integer i;
-                        shift_amt = s2_exp_b - s2_exp_a;
-                        shifted = {s2_mant_a, 3'b000};
-                        sticky = 1'b0;
-                        if (shift_amt > 11'd55) begin
-                            sticky = (shifted != 0);
-                            shifted = 56'd0;
-                        end else begin
-                            for (i = 0; i < 56; i = i + 1) begin
-                                if (i[10:0] < shift_amt)
-                                    sticky = sticky | shifted[i];
-                            end
-                            shifted = shifted >> shift_amt;
-                        end
-                        s2_add_mant_a = shifted;
-                        s2_add_mant_a[0] = s2_add_mant_a[0] | sticky;
-                    end
-                end
-            end
-
-            OP_MUL: begin
-                // Exponent = exp_a + exp_b - BIAS
-                s2_mul_exp = {2'b0, s2_exp_a} + {2'b0, s2_exp_b} - 13'd1023;
-            end
-
-            OP_DIV: begin
-                // Exponent = exp_a - exp_b + BIAS
-                s2_div_exp = {2'b0, s2_exp_a} - {2'b0, s2_exp_b} + 13'd1023;
-            end
-
-            default: ;
+            5'h14: s1_result_comb = fadd_result;
+            5'h15: s1_result_comb = fsub_result;
+            5'h16: s1_result_comb = fmul_result;
+            5'h17: s1_result_comb = fdiv_result;
+            default: s1_result_comb = 64'd0;
         endcase
     end
 
-    // ========================================================================
-    // STAGE 3 registers — Execute (mantissa operation)
-    // ========================================================================
-    reg        s3_special;
-    reg [63:0] s3_special_result;
-    reg [1:0]  s3_op;
-    reg        s3_result_sign;
-    reg [6:0]  s3_dest_tag;
-    reg [4:0]  s3_rob_idx;
+    assign issue_ready = (!s1_valid && !cdb_stall) || flush;
 
-    // ADD path from stage 2
-    reg        s3_add_eff_sub;
-    reg        s3_add_sign_a, s3_add_sign_b;
-    reg [12:0] s3_add_exp;
-    reg [55:0] s3_add_mant_a, s3_add_mant_b;
-
-    // MUL path from stage 2
-    reg [12:0] s3_mul_exp;
-    reg [52:0] s3_mul_mant_a, s3_mul_mant_b;
-
-    // DIV path from stage 2
-    reg [12:0] s3_div_exp;
-    reg [52:0] s3_div_mant_a, s3_div_mant_b;
-
-    // Stage 3 combinational outputs
-    reg        s3_exec_sign;
-    reg [12:0] s3_exec_exp;
-    reg [55:0] s3_exec_mant;   // result mantissa with GRS bits
-    // For MUL, we need wider product
-    reg [105:0] s3_mul_product;
-
-    always @(*) begin
-        s3_exec_sign = s3_result_sign;
-        s3_exec_exp  = 13'd0;
-        s3_exec_mant = 56'd0;
-        s3_mul_product = 106'd0;
-
-        case (s3_op)
-            OP_ADD: begin
-                // Add or subtract aligned mantissas
-                if (!s3_add_eff_sub) begin
-                    // Same sign: add mantissas, keep sign of A
-                    s3_exec_mant = s3_add_mant_a + s3_add_mant_b;
-                    s3_exec_sign = s3_add_sign_a;
-                end else begin
-                    // Different signs: subtract smaller from larger
-                    if (s3_add_mant_a >= s3_add_mant_b) begin
-                        s3_exec_mant = s3_add_mant_a - s3_add_mant_b;
-                        s3_exec_sign = s3_add_sign_a;
-                    end else begin
-                        s3_exec_mant = s3_add_mant_b - s3_add_mant_a;
-                        s3_exec_sign = s3_add_sign_b;
-                    end
-                end
-                s3_exec_exp = s3_add_exp;
-            end
-
-            OP_MUL: begin
-                // 53-bit x 53-bit multiplication
-                s3_mul_product = {53'd0, s3_mul_mant_a} * {53'd0, s3_mul_mant_b};
-                s3_exec_exp = s3_mul_exp;
-            end
-
-            OP_DIV: begin
-                // Mantissa division: produce 56 quotient bits (53 + 3 GRS)
-                begin : div_execute
-                    reg [52:0] divisor;
-                    reg [53:0] remainder;
-                    reg [55:0] quotient;
-                    integer i;
-
-                    divisor = s3_div_mant_b;
-                    remainder = 54'd0;
-                    quotient = 56'd0;
-
-                    if (divisor != 0) begin
-                        // Restoring division: 56 iterations for 53+3 bits
-                        remainder = {1'b0, s3_div_mant_a};
-                        for (i = 55; i >= 0; i = i - 1) begin
-                            remainder = remainder << 1;
-                            if (i < 53)
-                                remainder[0] = 1'b0; // shift in zero from dividend
-                            if (remainder >= {1'b0, divisor}) begin
-                                remainder = remainder - {1'b0, divisor};
-                                quotient[i] = 1'b1;
-                            end else begin
-                                quotient[i] = 1'b0;
-                            end
-                        end
-                        // Sticky: remainder != 0
-                        quotient[0] = quotient[0] | (remainder != 0);
-                    end
-
-                    s3_exec_mant = quotient;
-                end
-                s3_exec_exp = s3_div_exp;
-            end
-
-            default: ;
-        endcase
-    end
-
-    // ========================================================================
-    // STAGE 4 registers — Normalization
-    // ========================================================================
-    reg        s4_special;
-    reg [63:0] s4_special_result;
-    reg [1:0]  s4_op;
-    reg        s4_result_sign;
-    reg [12:0] s4_result_exp;
-    reg [55:0] s4_result_mant;       // for ADD/DIV
-    reg [105:0] s4_mul_product;      // for MUL
-    reg [6:0]  s4_dest_tag;
-    reg [4:0]  s4_rob_idx;
-
-    // Stage 4 combinational: normalize
-    reg        s4_norm_sign;
-    reg [12:0] s4_norm_exp;
-    reg [55:0] s4_norm_mant;  // normalized mantissa with GRS
-
-    always @(*) begin
-        s4_norm_sign = s4_result_sign;
-        s4_norm_exp  = s4_result_exp;
-        s4_norm_mant = 56'd0;
-
-        if (s4_special) begin
-            // Pass through, will be handled in stage 5
-            s4_norm_exp  = 13'd0;
-            s4_norm_mant = 56'd0;
-        end else begin
-            case (s4_op)
-                OP_ADD: begin
-                    // Normalize ADD/SUB result
-                    // The mantissa is in s4_result_mant[55:0] with format:
-                    //   bit 55: possible carry from addition
-                    //   bits 55:3 = mantissa, bits 2:0 = GRS
-                    if (s4_result_mant == 56'd0) begin
-                        // Zero result
-                        s4_norm_exp = 13'd0;
-                        s4_norm_mant = 56'd0;
-                        s4_norm_sign = 1'b0;
-                    end else if (s4_result_mant[55]) begin
-                        // Carry out: shift right by 1, increment exponent
-                        s4_norm_mant = {1'b0, s4_result_mant[55:1]};
-                        s4_norm_mant[0] = s4_norm_mant[0] | s4_result_mant[0]; // sticky
-                        s4_norm_exp = s4_result_exp + 13'd1;
-                    end else begin
-                        // Find leading 1 and shift left
-                        begin : add_norm
-                            reg [55:0] m;
-                            reg [12:0] e;
-                            integer k;
-                            m = s4_result_mant;
-                            e = s4_result_exp;
-                            // Leading bit should be at position 55 for carry,
-                            // or 54 for normal (1.xxx with 3 GRS bits = bit 55)
-                            // Actually our mantissa is {mant[52:0], G, R, S}
-                            // so "1" should be at bit 55 after normalization
-                            // Currently bit 55 is 0 (no carry), find leading 1
-                            for (k = 0; k < 55; k = k + 1) begin
-                                if (!m[55] && m != 0 && e > 0) begin
-                                    m = m << 1;
-                                    e = e - 13'd1;
-                                end
-                            end
-                            s4_norm_mant = m;
-                            s4_norm_exp  = e;
-                        end
-                    end
-                end
-
-                OP_MUL: begin
-                    // Product is 106 bits from 53x53
-                    // Format: product[105:0], with bit 105 = MSB
-                    // Normal result: 1.xx * 1.yy = 1x.xxx or 01.xxx
-                    // We need to extract 53 mantissa bits + GRS
-                    if (s4_mul_product == 106'd0) begin
-                        s4_norm_exp = 13'd0;
-                        s4_norm_mant = 56'd0;
-                    end else if (s4_mul_product[105]) begin
-                        // Product >= 2.0: MSB at bit 105
-                        // Take bits [105:51] for mantissa (55 bits) + sticky from [50:0]
-                        s4_norm_mant = {s4_mul_product[105:51], (s4_mul_product[50:0] != 0)};
-                        s4_norm_exp  = s4_result_exp + 13'd1;
-                    end else begin
-                        // Product < 2.0: MSB at bit 104
-                        // Take bits [104:50] for mantissa (55 bits) + sticky from [49:0]
-                        s4_norm_mant = {s4_mul_product[104:50], (s4_mul_product[49:0] != 0)};
-                        s4_norm_exp  = s4_result_exp;
-                    end
-                end
-
-                OP_DIV: begin
-                    // Quotient in s4_result_mant[55:0]
-                    // Normalize: find leading 1
-                    if (s4_result_mant == 56'd0) begin
-                        s4_norm_exp  = 13'd0;
-                        s4_norm_mant = 56'd0;
-                    end else begin
-                        begin : div_norm
-                            reg [55:0] m;
-                            reg [12:0] e;
-                            integer k;
-                            m = s4_result_mant;
-                            e = s4_result_exp;
-                            for (k = 0; k < 55; k = k + 1) begin
-                                if (!m[55] && m != 0) begin
-                                    m = m << 1;
-                                    e = e - 13'd1;
-                                end
-                            end
-                            s4_norm_mant = m;
-                            s4_norm_exp  = e;
-                        end
-                    end
-                end
-
-                default: ;
-            endcase
-        end
-    end
-
-    // ========================================================================
-    // STAGE 5 registers — Rounding / Pack
-    // ========================================================================
-    reg        s5_special;
-    reg [63:0] s5_special_result;
-    reg        s5_norm_sign;
-    reg [12:0] s5_norm_exp;
-    reg [55:0] s5_norm_mant;
-    reg [6:0]  s5_dest_tag;
-    reg [4:0]  s5_rob_idx;
-
-    // Stage 5 combinational: round-to-nearest-even and pack
-    reg [63:0] s5_packed;
-
-    always @(*) begin
-        if (s5_special) begin
-            s5_packed = s5_special_result;
-        end else begin
-            begin : round_pack
-                reg [52:0] frac;      // {1, mantissa[51:0]}
-                reg [12:0] exp_out;
-                reg        guard, round_bit, sticky;
-                reg        round_up;
-                reg [52:0] frac_rounded;
-
-                // The normalized mantissa has format:
-                //   bit 55 = leading 1 (implicit), bits 54:3 = fraction, bits 2:0 = GRS
-                frac      = s5_norm_mant[55:3];
-                guard     = s5_norm_mant[2];
-                round_bit = s5_norm_mant[1];
-                sticky    = s5_norm_mant[0];
-                exp_out   = s5_norm_exp;
-
-                // Round to nearest even
-                round_up = guard & (round_bit | sticky | frac[0]);
-
-                frac_rounded = frac + {52'd0, round_up};
-
-                // Check if rounding caused carry (1.111...1 + 1 = 10.000...0)
-                if (frac_rounded[52] && !frac[52]) begin
-                    // This shouldn't happen if frac[52] was already 1
-                    // But if mantissa was all 1s and rounded up:
-                    frac_rounded = frac_rounded >> 1;
-                    exp_out = exp_out + 13'd1;
-                end else if (frac[52] && frac_rounded == 53'd0) begin
-                    // Overflow from rounding: e.g., all-ones frac
-                    exp_out = exp_out + 13'd1;
-                    frac_rounded = {1'b1, 52'd0};
-                end
-
-                // Overflow check
-                if (exp_out >= 13'd2047) begin
-                    // Overflow -> Infinity
-                    s5_packed = {s5_norm_sign, 11'h7FF, 52'd0};
-                end
-                // Underflow check
-                else if (exp_out[12] || exp_out == 13'd0) begin
-                    // Underflow -> Zero (flush to zero for simplicity)
-                    s5_packed = {s5_norm_sign, 11'd0, 52'd0};
-                end
-                else begin
-                    // Normal result: strip implicit leading 1
-                    s5_packed = {s5_norm_sign, exp_out[10:0], frac_rounded[51:0]};
-                end
-            end
-        end
-    end
-
-    // ========================================================================
-    // Pipeline register updates
-    // ========================================================================
     always @(posedge clk or posedge rst) begin
         if (rst || flush) begin
             s1_valid  <= 1'b0;
@@ -2815,9 +2256,8 @@ module fpu_pipe(
             s5_valid  <= 1'b0;
             cdb_valid <= 1'b0;
         end else if (cdb_stall) begin
-            // Hold all pipeline state when CDB is stalled
+            // Hold the entire pipe when the CDB can't accept a result.
         end else begin
-            // ---- Latch issue into Stage 1 ----
             s1_valid <= issue_valid && issue_ready;
             if (issue_valid && issue_ready) begin
                 s1_opcode   <= issue_opcode;
@@ -2827,71 +2267,29 @@ module fpu_pipe(
                 s1_rob_idx  <= issue_rob_idx;
             end
 
-            // ---- Stage 1 -> Stage 2 (Unpack -> Alignment) ----
-            s2_valid          <= s1_valid;
-            s2_special        <= s1_special;
-            s2_special_result <= s1_special_result;
-            s2_op             <= s1_op;
-            s2_sign_a         <= s1_sign_a;
-            s2_sign_b         <= s1_sign_b;
-            s2_result_sign    <= s1_result_sign;
-            s2_exp_a          <= s1_exp_a;
-            s2_exp_b          <= s1_exp_b;
-            s2_mant_a         <= s1_mant_a;
-            s2_mant_b         <= s1_mant_b;
-            s2_dest_tag       <= s1_dest_tag;
-            s2_rob_idx        <= s1_rob_idx;
+            s2_valid    <= s1_valid;
+            s2_result   <= s1_result_comb;
+            s2_dest_tag <= s1_dest_tag;
+            s2_rob_idx  <= s1_rob_idx;
 
-            // ---- Stage 2 -> Stage 3 (Alignment -> Execute) ----
-            s3_valid          <= s2_valid;
-            s3_special        <= s2_special;
-            s3_special_result <= s2_special_result;
-            s3_op             <= s2_op;
-            s3_result_sign    <= s2_result_sign;
-            s3_dest_tag       <= s2_dest_tag;
-            s3_rob_idx        <= s2_rob_idx;
-            // ADD path
-            s3_add_eff_sub    <= s2_add_eff_sub;
-            s3_add_sign_a     <= s2_add_sign_a;
-            s3_add_sign_b     <= s2_add_sign_b;
-            s3_add_exp        <= s2_add_exp;
-            s3_add_mant_a     <= s2_add_mant_a;
-            s3_add_mant_b     <= s2_add_mant_b;
-            // MUL path
-            s3_mul_exp        <= s2_mul_exp;
-            s3_mul_mant_a     <= s2_mul_mant_a;
-            s3_mul_mant_b     <= s2_mul_mant_b;
-            // DIV path
-            s3_div_exp        <= s2_div_exp;
-            s3_div_mant_a     <= s2_div_mant_a;
-            s3_div_mant_b     <= s2_div_mant_b;
+            s3_valid    <= s2_valid;
+            s3_result   <= s2_result;
+            s3_dest_tag <= s2_dest_tag;
+            s3_rob_idx  <= s2_rob_idx;
 
-            // ---- Stage 3 -> Stage 4 (Execute -> Normalize) ----
-            s4_valid          <= s3_valid;
-            s4_special        <= s3_special;
-            s4_special_result <= s3_special_result;
-            s4_op             <= s3_op;
-            s4_result_sign    <= s3_exec_sign;
-            s4_result_exp     <= s3_exec_exp;
-            s4_result_mant    <= s3_exec_mant;
-            s4_mul_product    <= s3_mul_product;
-            s4_dest_tag       <= s3_dest_tag;
-            s4_rob_idx        <= s3_rob_idx;
+            s4_valid    <= s3_valid;
+            s4_result   <= s3_result;
+            s4_dest_tag <= s3_dest_tag;
+            s4_rob_idx  <= s3_rob_idx;
 
-            // ---- Stage 4 -> Stage 5 (Normalize -> Round/Pack) ----
-            s5_valid          <= s4_valid;
-            s5_special        <= s4_special;
-            s5_special_result <= s4_special_result;
-            s5_norm_sign      <= s4_norm_sign;
-            s5_norm_exp       <= s4_norm_exp;
-            s5_norm_mant      <= s4_norm_mant;
-            s5_dest_tag       <= s4_dest_tag;
-            s5_rob_idx        <= s4_rob_idx;
+            s5_valid    <= s4_valid;
+            s5_result   <= s4_result;
+            s5_dest_tag <= s4_dest_tag;
+            s5_rob_idx  <= s4_rob_idx;
 
-            // ---- Stage 5 -> CDB output ----
             cdb_valid   <= s5_valid;
             cdb_tag     <= s5_dest_tag;
-            cdb_value   <= s5_packed;
+            cdb_value   <= s5_result;
             cdb_rob_idx <= s5_rob_idx;
         end
     end
@@ -3355,13 +2753,9 @@ module store_queue(
             rob_store_addr_value <= 64'd0;
             rob_store_ready_value <= 64'd0;
         end else if (flush) begin
-            for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
-                sq_valid[i] <= 0;
-                sq_addr_base_ready[i] <= 0;
-                sq_data_ready[i] <= 0;
-                sq_addr_computed[i] <= 0;
-            end
-            age_counter <= 0;
+            // Preserve existing SQ entries across branch redirects. With only one unresolved
+            // branch allowed in flight, younger wrong-path stores are never dispatched here,
+            // and CALL's own stack-push must survive the redirect.
             rob_store_addr_ready <= 0;
             rob_store_data_ready <= 0;
             rob_store_addr_value <= 64'd0;
@@ -3703,13 +3097,21 @@ module rob(
                 reg can_commit2;
                 reg [4:0] head2;
                 reg is_store1, is_store2;
+                reg is_call1, is_call2;
 
                 head2 = head + 5'd1;
                 is_store1 = (itype[head] == ITYPE_STORE);
                 is_store2 = (itype[head2] == ITYPE_STORE);
+                // CALL is encoded as a branch ROB entry with an accompanying SQ entry.
+                // Wait for that SQ entry to have both address and data ready before retiring it.
+                is_call1 = (itype[head] == ITYPE_BRANCH) &&
+                           (store_addr_rdy[head] || store_data_rdy[head]);
+                is_call2 = (itype[head2] == ITYPE_BRANCH) &&
+                           (store_addr_rdy[head2] || store_data_rdy[head2]);
 
                 can_commit1 = valid[head] && (
-                    complete[head] ||
+                    (complete[head] && (!is_call1 ||
+                     (store_addr_rdy[head] && store_data_rdy[head]))) ||
                     (is_store1 && store_addr_rdy[head] && store_data_rdy[head]) ||
                     (itype[head] == ITYPE_HALT)
                 );
@@ -3734,7 +3136,8 @@ module rob(
 
                     // Try second commit
                     can_commit2 = valid[head2] && (count > 6'd1) && (
-                        complete[head2] ||
+                        (complete[head2] && (!is_call2 ||
+                         (store_addr_rdy[head2] && store_data_rdy[head2]))) ||
                         (is_store2 && store_addr_rdy[head2] && store_data_rdy[head2]) ||
                         (itype[head2] == ITYPE_HALT)
                     );
