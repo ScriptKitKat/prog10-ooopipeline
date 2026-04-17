@@ -156,20 +156,60 @@ module tinker_core(
     wire cdb_alu1_stall, cdb_fpu1_stall, cdb_lsu1_stall;
 
     // ================================================================
-    // Branch resolution: combine from both ALU pipes
-    // ================================================================
-    wire        br_resolved_combined = alu0_br_resolved || alu1_br_resolved || lq_br_resolved;
-    wire        br_taken_combined    = alu0_br_resolved ? alu0_br_taken :
-                                       alu1_br_resolved ? alu1_br_taken : lq_br_taken;
-    wire [63:0] br_target_combined   = alu0_br_resolved ? alu0_br_target :
-                                       alu1_br_resolved ? alu1_br_target : lq_br_target;
-    wire [4:0]  br_rob_idx_combined  = alu0_br_resolved ? alu0_br_rob_idx :
-                                       alu1_br_resolved ? alu1_br_rob_idx : lq_br_rob_idx;
-
-    // ================================================================
     // Flush signal (from ROB misprediction)
     // ================================================================
     wire flush = rob_flush_all;
+
+    // ================================================================
+    // Branch resolution: combine from ALU pipes + LQ with overflow queue
+    // When multiple branches resolve simultaneously, one is deferred to next cycle
+    // ================================================================
+    reg        br_deferred_valid;
+    reg        br_deferred_taken;
+    reg [63:0] br_deferred_target;
+    reg [4:0]  br_deferred_rob_idx;
+
+    // Count how many sources are resolving this cycle
+    wire [1:0] br_resolve_count = {1'b0, alu0_br_resolved} + {1'b0, alu1_br_resolved} + {1'b0, lq_br_resolved};
+
+    // Include deferred resolution as a source (lowest priority)
+    wire        br_resolved_combined = alu0_br_resolved || alu1_br_resolved || lq_br_resolved || br_deferred_valid;
+    wire        br_taken_combined    = alu0_br_resolved ? alu0_br_taken :
+                                       alu1_br_resolved ? alu1_br_taken :
+                                       lq_br_resolved   ? lq_br_taken : br_deferred_taken;
+    wire [63:0] br_target_combined   = alu0_br_resolved ? alu0_br_target :
+                                       alu1_br_resolved ? alu1_br_target :
+                                       lq_br_resolved   ? lq_br_target : br_deferred_target;
+    wire [4:0]  br_rob_idx_combined  = alu0_br_resolved ? alu0_br_rob_idx :
+                                       alu1_br_resolved ? alu1_br_rob_idx :
+                                       lq_br_resolved   ? lq_br_rob_idx : br_deferred_rob_idx;
+
+    // Determine if a second resolution is being dropped and needs deferral
+    // Second resolution = the one NOT selected by the priority encoder above
+    wire br_second_valid = (br_resolve_count > 2'd1);
+    wire        br_second_taken  = alu0_br_resolved && alu1_br_resolved ? alu1_br_taken :
+                                   alu0_br_resolved && lq_br_resolved   ? lq_br_taken :
+                                   alu1_br_resolved && lq_br_resolved   ? lq_br_taken : 1'b0;
+    wire [63:0] br_second_target = alu0_br_resolved && alu1_br_resolved ? alu1_br_target :
+                                   alu0_br_resolved && lq_br_resolved   ? lq_br_target :
+                                   alu1_br_resolved && lq_br_resolved   ? lq_br_target : 64'd0;
+    wire [4:0]  br_second_rob    = alu0_br_resolved && alu1_br_resolved ? alu1_br_rob_idx :
+                                   alu0_br_resolved && lq_br_resolved   ? lq_br_rob_idx :
+                                   alu1_br_resolved && lq_br_resolved   ? lq_br_rob_idx : 5'd0;
+
+    always @(posedge clk or posedge reset) begin
+        if (reset || flush) begin
+            br_deferred_valid <= 1'b0;
+        end else if (br_second_valid) begin
+            // A second branch resolved this cycle; defer it to next cycle
+            br_deferred_valid     <= 1'b1;
+            br_deferred_taken     <= br_second_taken;
+            br_deferred_target    <= br_second_target;
+            br_deferred_rob_idx   <= br_second_rob;
+        end else begin
+            br_deferred_valid <= 1'b0;
+        end
+    end
 
     // ================================================================
     // Round-robin state for RS assignment
@@ -220,11 +260,13 @@ module tinker_core(
     wire fpu_rr_after1;
 
     // Does instruction write to rd? (need to allocate phys reg)
-    wire writes_rd1 = fu_out_valid1 && !is_halt1;
-    wire writes_rd2 = fu_out_valid2 && !is_halt2 && !is_store2_only;
-    // Correct writes_rd: stores don't write rd
-    wire alloc_preg1 = fu_out_valid1 && !is_halt1 && !is_store1_only;
-    wire alloc_preg2 = fu_out_valid2 && !is_halt2 && !is_store2_only;
+    // Branches that don't produce a result (BR, BRR, BRR_L, BRNZ, BRGT) must NOT allocate:
+    //   their rd field is the branch TARGET register, not a write destination.
+    // Only CALL and RETURN write r31 (handled via dest_areg = r31).
+    wire is_branch_no_write1 = is_branch1 && !is_call1;  // BR, BRR, BRR_L, BRNZ, BRGT
+    wire is_branch_no_write2 = is_branch2 && !is_call2;
+    wire alloc_preg1 = fu_out_valid1 && !is_halt1 && !is_store1_only && !is_branch_no_write1;
+    wire alloc_preg2 = fu_out_valid2 && !is_halt2 && !is_store2_only && !is_branch_no_write2;
 
     // Determine which arch register to read for each source
     // src1 mapping for instruction 1
@@ -550,9 +592,10 @@ module tinker_core(
                            is_halt2   ? ITYPE_HALT :
                            ITYPE_ALU;
 
-    // Branch prediction: always predict not-taken for simplicity
-    wire branch_pred1 = 1'b0;
-    wire branch_pred2 = 1'b0;
+    // Branch prediction: BTFNT (backward-taken, forward-not-taken)
+    // If the branch target is before the current PC, predict taken (likely a loop)
+    wire branch_pred1 = (is_branch1 && imm1[63]) ? 1'b1 : 1'b0;  // negative offset = backward
+    wire branch_pred2 = (is_branch2 && imm2[63]) ? 1'b1 : 1'b0;
 
     // ================================================================
     // Snapshot ID management for branch RAT checkpoints
@@ -636,9 +679,6 @@ module tinker_core(
         .out_instr2(fu_out_instr2),
         .out_pc2(fu_out_pc2),
         .decode_stall(decode_stall),
-        .bp_update_en(br_resolved_combined),
-        .bp_update_pc(br_target_combined),
-        .bp_update_taken(br_taken_combined),
         .flush(flush),
         .redirect_pc(rob_mispredict_target)
     );
@@ -3168,6 +3208,7 @@ module store_queue(
     reg [4:0] sq_rob_idx [0:NUM_ENTRIES-1];
     reg [4:0] sq_opcode [0:NUM_ENTRIES-1];
     reg sq_addr_computed [0:NUM_ENTRIES-1];
+    reg sq_committed [0:NUM_ENTRIES-1];  // Set when ROB commits; preserved across flush
     reg [63:0] sq_addr [0:NUM_ENTRIES-1];
     reg [4:0] sq_age [0:NUM_ENTRIES-1];
 
@@ -3239,12 +3280,26 @@ module store_queue(
 
     integer i;
     always @(posedge clk or posedge rst) begin
-        if (rst || flush) begin
+        if (rst) begin
             for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
                 sq_valid[i] <= 0;
                 sq_addr_base_ready[i] <= 0;
                 sq_data_ready[i] <= 0;
                 sq_addr_computed[i] <= 0;
+                sq_committed[i] <= 0;
+            end
+            age_counter <= 0;
+            rob_store_addr_ready <= 0;
+            rob_store_data_ready <= 0;
+        end else if (flush) begin
+            // On flush, only clear non-committed (speculative) entries
+            for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
+                if (!sq_committed[i]) begin
+                    sq_valid[i] <= 0;
+                    sq_addr_base_ready[i] <= 0;
+                    sq_data_ready[i] <= 0;
+                    sq_addr_computed[i] <= 0;
+                end
             end
             age_counter <= 0;
             rob_store_addr_ready <= 0;
@@ -3291,14 +3346,16 @@ module store_queue(
                 end
             end
 
-            // Commit: free entry
+            // Commit: mark as committed, then free (write already happened combinationally)
             if (commit_en && commit_found) begin
                 sq_valid[commit_slot] <= 0;
+                sq_committed[commit_slot] <= 0;
             end
 
             // Dispatch
             if (dispatch_en && free_found) begin
                 sq_valid[free_slot] <= 1;
+                sq_committed[free_slot] <= 0;
                 sq_addr_base_val[free_slot] <= dispatch_addr_base_val;
                 sq_addr_base_tag[free_slot] <= dispatch_addr_base_tag;
                 sq_addr_base_ready[free_slot] <= dispatch_addr_base_ready;
@@ -3479,9 +3536,14 @@ module rob(
             commit_en2 <= 0;
 
             // Track whether a mispredict fires this cycle (blocking var for alloc guard)
+            // Unified count tracking to avoid non-blocking assignment conflicts
             begin : mispredict_guard
                 reg this_cycle_flush;
+                reg [5:0] commit_count;
+                reg [5:0] alloc_count;
                 this_cycle_flush = 0;
+                commit_count = 0;
+                alloc_count = 0;
 
             // --- CDB completion ---
             if (cdb0_valid && valid[cdb0_rob_idx]) begin
@@ -3536,7 +3598,8 @@ module rob(
             end
 
             // --- Commit (up to 2/cycle from head) ---
-            begin
+            // Suppress commits when mispredict detected this cycle
+            if (!this_cycle_flush) begin
                 reg can_commit1;
                 reg can_commit2;
                 reg [4:0] head2;
@@ -3564,6 +3627,7 @@ module rob(
                     complete[head] <= 0;
                     store_addr_rdy[head] <= 0;
                     store_data_rdy[head] <= 0;
+                    commit_count = commit_count + 6'd1;
 
                     if (itype[head] == ITYPE_HALT) begin
                         halt_committed <= 1;
@@ -3593,16 +3657,15 @@ module rob(
                         complete[head2] <= 0;
                         store_addr_rdy[head2] <= 0;
                         store_data_rdy[head2] <= 0;
+                        commit_count = commit_count + 6'd1;
 
                         if (itype[head2] == ITYPE_HALT) begin
                             halt_committed <= 1;
                         end
 
                         head <= head + 5'd2;
-                        count <= count - 6'd2;
                     end else begin
                         head <= head + 5'd1;
-                        count <= count - 6'd1;
                     end
                 end
             end
@@ -3623,6 +3686,7 @@ module rob(
                 branch_resolved_flag[tail] <= 0;
                 store_addr_rdy[tail] <= 0;
                 store_data_rdy[tail] <= 0;
+                alloc_count = alloc_count + 6'd1;
 
                 if (alloc_en2) begin
                     valid[tail + 5'd1] <= 1;
@@ -3638,13 +3702,18 @@ module rob(
                     branch_resolved_flag[tail + 5'd1] <= 0;
                     store_addr_rdy[tail + 5'd1] <= 0;
                     store_data_rdy[tail + 5'd1] <= 0;
+                    alloc_count = alloc_count + 6'd1;
 
                     tail <= tail + 5'd2;
-                    count <= count + 6'd2;
                 end else begin
                     tail <= tail + 5'd1;
-                    count <= count + 6'd1;
                 end
+            end
+
+            // --- Unified count update (avoids non-blocking assignment conflicts) ---
+            // When mispredict fires, count is set directly; commits/allocs are suppressed
+            if (!this_cycle_flush) begin
+                count <= count - commit_count + alloc_count;
             end
             end // mispredict_guard
         end
@@ -3680,18 +3749,10 @@ module fetch_unit(
     // Backpressure
     input  wire        decode_stall,
 
-    // BHT update from branch resolution
-    input  wire        bp_update_en,
-    input  wire [63:0] bp_update_pc,
-    input  wire        bp_update_taken,
-
     // Flush / redirect
     input  wire        flush,
     input  wire [63:0] redirect_pc
 );
-
-    // Branch History Table: 256 entries, 1-bit, indexed by PC[9:2]
-    reg bht [0:255];
 
     // Fetch buffer: 16-entry circular buffer, each entry = {pc(64), instruction(32)}
     reg [95:0] fbuf [0:15];
@@ -3737,19 +3798,12 @@ module fetch_unit(
             fb_head <= 0;
             fb_tail <= 0;
             fb_count <= 0;
-            for (j = 0; j < 256; j = j + 1)
-                bht[j] <= 0;
         end else if (flush) begin
             pc_reg <= redirect_pc;
             fb_head <= 0;
             fb_tail <= 0;
             fb_count <= 0;
-            if (bp_update_en)
-                bht[bp_update_pc[9:2]] <= bp_update_taken;
         end else begin
-            // BHT update
-            if (bp_update_en)
-                bht[bp_update_pc[9:2]] <= bp_update_taken;
 
             // Drain from head
             fb_head <= fb_head + {2'b0, drain_cnt};
