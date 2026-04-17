@@ -557,8 +557,8 @@ module tinker_core(
     wire [6:0]  lq_disp_base_tag = lq_disp_from1 ? prf_rd1 : prf_rd3;
     wire        lq_disp_base_rdy = lq_disp_from1 ? src1_rdy1 : src1_rdy2;
     wire [63:0] lq_disp_imm      = lq_disp_from1 ?
-                                    (is_return1 ? -64'sd8 : dispatch_imm1) :
-                                    (is_return2 ? -64'sd8 : dispatch_imm2);
+                                    (is_return1 ? 64'sd0 : dispatch_imm1) :
+                                    (is_return2 ? 64'sd0 : dispatch_imm2);
     wire [6:0]  lq_disp_dest_tag = lq_disp_from1 ? new_phys_rd1 : new_phys_rd2;
     wire [4:0]  lq_disp_rob_idx  = lq_disp_from1 ? rob_alloc_idx1 : rob_alloc_idx2;
     wire [4:0]  lq_disp_opcode   = lq_disp_from1 ? opcode1 : opcode2;
@@ -2065,9 +2065,10 @@ module alu_pipe(
                 s1_cat_next = CAT_MOVE; s1_sub_next = SUB_MOV;
                 s1_opa_next = issue_src1;
             end
-            5'h12: begin // MOVI -> move sign-extended immediate into destination register
+            5'h12: begin // MOVI -> result = {L, rd[51:0]}
                 s1_cat_next = CAT_MOVE; s1_sub_next = SUB_MOVI;
-                s1_opb_next = issue_imm;
+                s1_opa_next = issue_src1; // rd value (lower 52 bits preserved)
+                s1_opb_next = issue_imm;  // sign-extended L (use [11:0])
             end
 
             default: begin
@@ -2138,7 +2139,7 @@ module alu_pipe(
             CAT_MOVE: begin
                 case (s1_sub_op)
                     SUB_MOV:  s2_result_comb = s1_operand_a;
-                    SUB_MOVI: s2_result_comb = s1_operand_b;
+                    SUB_MOVI: s2_result_comb = {s1_operand_b[11:0], s1_operand_a[51:0]};
                     default:  s2_result_comb = 64'd0;
                 endcase
             end
@@ -2569,7 +2570,7 @@ module load_queue(
                 // RETURN: CDB value = address (r31-8) for r31 update; branch target = loaded data
                 // Regular load: CDB value = loaded data
                 if (lq_opcode[cdb_slot] == 5'h0d) begin
-                    cdb_value <= lq_addr[cdb_slot]; // r31 - 8
+                    cdb_value <= lq_addr[cdb_slot] + 64'd8; // r31 + 8 (pop stack)
                     br_resolved <= 1;
                     br_taken <= 1;
                     br_target <= lq_mem_data[cdb_slot]; // loaded return address
@@ -3968,7 +3969,7 @@ module alu(
             // mov operations
             5'h10: result = rs_data + extended_L; // mov rd, (rs)(L)
             5'h11: result = rs_data; // mov rd, rs
-            5'h12: result = extended_L; // mov rd [52:63], L
+            5'h12: result = {extended_L[11:0], rd_data[51:0]}; // MOVI: L into [63:52], preserve rd[51:0]
             5'h13: result = rd_data + extended_L; // mov (rd)(L), rs
             
             // FPU operations in another file: fpu.sv
