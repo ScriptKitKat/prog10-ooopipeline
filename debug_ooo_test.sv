@@ -57,8 +57,8 @@ module tinker_ooo_tb;
     integer i;
 
     initial begin
-        // $dumpfile("tinker_ooo_tb.vcd");
-        // $dumpvars(0, tinker_ooo_tb);
+        $dumpfile("tinker_ooo_tb.vcd");
+        $dumpvars(0, tinker_ooo_tb);
 
         clk = 0;
         pass_count = 0;
@@ -185,7 +185,7 @@ module tinker_ooo_tb;
         store_instr(64'h2038, mk_instr(5'h08, 5'd26, 5'd0, 5'd0, 12'd0));
 
         #8 reset = 0;
-        repeat (2000) @(posedge clk);
+        repeat (500) @(posedge clk);
 
         check_reg(21, 64'd0, "branch loop r21 final=0");
         if (hlt !== 1'b1) begin

@@ -50,6 +50,7 @@ module tinker_core(
     wire        rob_mispredict, rob_flush_all;
     wire [63:0] rob_mispredict_target;
     wire [4:0]  rob_mispredict_rob_idx;
+    wire [1:0]  rob_mispredict_snap_id;
     wire        rob_commit_en1, rob_commit_en2;
     wire [2:0]  rob_commit_type1, rob_commit_type2;
     wire [4:0]  rob_commit_arch_rd1, rob_commit_arch_rd2;
@@ -130,6 +131,10 @@ module tinker_core(
     wire [6:0]  lq_cdb_tag;
     wire [63:0] lq_cdb_value;
     wire [4:0]  lq_cdb_rob;
+    wire        lq_br_resolved;
+    wire        lq_br_taken;
+    wire [63:0] lq_br_target;
+    wire [4:0]  lq_br_rob_idx;
 
     // ================================================================
     // Wires: Store Queue
@@ -153,10 +158,13 @@ module tinker_core(
     // ================================================================
     // Branch resolution: combine from both ALU pipes
     // ================================================================
-    wire        br_resolved_combined = alu0_br_resolved || alu1_br_resolved;
-    wire        br_taken_combined    = alu0_br_resolved ? alu0_br_taken : alu1_br_taken;
-    wire [63:0] br_target_combined   = alu0_br_resolved ? alu0_br_target : alu1_br_target;
-    wire [4:0]  br_rob_idx_combined  = alu0_br_resolved ? alu0_br_rob_idx : alu1_br_rob_idx;
+    wire        br_resolved_combined = alu0_br_resolved || alu1_br_resolved || lq_br_resolved;
+    wire        br_taken_combined    = alu0_br_resolved ? alu0_br_taken :
+                                       alu1_br_resolved ? alu1_br_taken : lq_br_taken;
+    wire [63:0] br_target_combined   = alu0_br_resolved ? alu0_br_target :
+                                       alu1_br_resolved ? alu1_br_target : lq_br_target;
+    wire [4:0]  br_rob_idx_combined  = alu0_br_resolved ? alu0_br_rob_idx :
+                                       alu1_br_resolved ? alu1_br_rob_idx : lq_br_rob_idx;
 
     // ================================================================
     // Flush signal (from ROB misprediction)
@@ -179,26 +187,26 @@ module tinker_core(
     // Instruction classification for slot 1
     wire is_alu1  = (opcode1 >= 5'h18 && opcode1 <= 5'h1d) ||
                     (opcode1 >= 5'h00 && opcode1 <= 5'h07) ||
-                    (opcode1 >= 5'h08 && opcode1 <= 5'h0e) ||
+                    (opcode1 >= 5'h08 && opcode1 <= 5'h0e && opcode1 != 5'h0d) ||
                     (opcode1 == 5'h11) || (opcode1 == 5'h12);
     wire is_fpu1  = (opcode1 >= 5'h14 && opcode1 <= 5'h17);
     wire is_load1 = (opcode1 == 5'h10);
     wire is_store1= (opcode1 == 5'h13);
     wire is_halt1 = (opcode1 == 5'h0f);
-    wire is_branch1 = (opcode1 >= 5'h08 && opcode1 <= 5'h0e);
+    wire is_branch1 = (opcode1 >= 5'h08 && opcode1 <= 5'h0e) && (opcode1 != 5'h0d);
     wire is_call1 = (opcode1 == 5'h0c);
     wire is_return1 = (opcode1 == 5'h0d);
 
     // Instruction classification for slot 2
     wire is_alu2  = (opcode2 >= 5'h18 && opcode2 <= 5'h1d) ||
                     (opcode2 >= 5'h00 && opcode2 <= 5'h07) ||
-                    (opcode2 >= 5'h08 && opcode2 <= 5'h0e) ||
+                    (opcode2 >= 5'h08 && opcode2 <= 5'h0e && opcode2 != 5'h0d) ||
                     (opcode2 == 5'h11) || (opcode2 == 5'h12);
     wire is_fpu2  = (opcode2 >= 5'h14 && opcode2 <= 5'h17);
     wire is_load2 = (opcode2 == 5'h10);
     wire is_store2= (opcode2 == 5'h13);
     wire is_halt2 = (opcode2 == 5'h0f);
-    wire is_branch2 = (opcode2 >= 5'h08 && opcode2 <= 5'h0e);
+    wire is_branch2 = (opcode2 >= 5'h08 && opcode2 <= 5'h0e) && (opcode2 != 5'h0d);
     wire is_call2 = (opcode2 == 5'h0c);
     wire is_return2 = (opcode2 == 5'h0d);
 
@@ -216,7 +224,7 @@ module tinker_core(
     wire writes_rd2 = fu_out_valid2 && !is_halt2 && !is_store2_only;
     // Correct writes_rd: stores don't write rd
     wire alloc_preg1 = fu_out_valid1 && !is_halt1 && !is_store1_only;
-    wire alloc_preg2 = fu_out_valid2 && !is_halt2 && !is_store2_only && !decode_stall;
+    wire alloc_preg2 = fu_out_valid2 && !is_halt2 && !is_store2_only;
 
     // Determine which arch register to read for each source
     // src1 mapping for instruction 1
@@ -224,27 +232,23 @@ module tinker_core(
                              opcode1 == 5'h05 || opcode1 == 5'h07 ||
                              opcode1 == 5'h12) ? rd1 :   // ADDI,SUBI,SHFTRI,SHFTLI,MOVI read rd
                             (opcode1 == 5'h08 || opcode1 == 5'h09 ||
-                             opcode1 == 5'h0b || opcode1 == 5'h0c ||
-                             opcode1 == 5'h0e) ? rd1 :   // BR,BRR,BRNZ,CALL,BRGT read rd as target
-                            rs1;                          // default: rs
+                             opcode1 == 5'h0b || opcode1 == 5'h0c) ? rd1 :   // BR,BRR,BRNZ,CALL read rd as target
+                            rs1;                          // default: rs (also BRGT: src1=rs)
     // src2 mapping for instruction 1
     wire [4:0] src2_areg1 = (opcode1 == 5'h0b) ? rs1 :  // BRNZ: src2=rs (condition)
                             (opcode1 == 5'h0c) ? 5'd31 : // CALL: src2=r31
-                            (opcode1 == 5'h0e) ? rs1 :   // BRGT: src2=rs (comparison)
-                            rt1;                          // default: rt
+                            rt1;                          // default: rt (also BRGT: src2=rt)
 
     // src1 mapping for instruction 2
     wire [4:0] src1_areg2 = (opcode2 == 5'h19 || opcode2 == 5'h1b ||
                              opcode2 == 5'h05 || opcode2 == 5'h07 ||
                              opcode2 == 5'h12) ? rd2 :
                             (opcode2 == 5'h08 || opcode2 == 5'h09 ||
-                             opcode2 == 5'h0b || opcode2 == 5'h0c ||
-                             opcode2 == 5'h0e) ? rd2 :
-                            rs2;
+                             opcode2 == 5'h0b || opcode2 == 5'h0c) ? rd2 :
+                            rs2;  // default: rs (also BRGT: src1=rs)
     wire [4:0] src2_areg2 = (opcode2 == 5'h0b) ? rs2 :
                             (opcode2 == 5'h0c) ? 5'd31 :
-                            (opcode2 == 5'h0e) ? rs2 :
-                            rt2;
+                            rt2;  // default: rt (also BRGT: src2=rt)
 
     // For stores: addr_base is rd, data is rs
     wire [4:0] store_addr_areg1 = rd1;
@@ -303,271 +307,6 @@ module tinker_core(
     wire [6:0] new_phys_rd1 = fl_deq_preg1;
     wire [6:0] new_phys_rd2 = fl_deq_preg2;
 
-    // Old physical register for ROB (current RAT mapping of dest_areg before rename)
-    // We need to read the RAT for dest_areg before updating it
-    // Since our RAT read ports are used for sources, we need the old mapping
-    // For instr1: old mapping = rat_table[dest_areg1] (before any writes this cycle)
-    // For instr2: if dest_areg2 == dest_areg1 and instr1 writes, old = new_phys_rd1
-    //             else old = rat_table[dest_areg2]
-    // We'll read the RAT for dest_areg using additional combinational logic
-    // But we only have 4 RAT read ports... We need to be creative.
-    // Solution: We read old_phys from RAT using the same ports in a time-multiplexed way
-    // Actually, let's just add wire taps - the RAT module exposes read ports.
-    // We'll use a separate mechanism: store the old phys in the rename stage.
-    // For now, since we have 4 read ports and need at most 4 per cycle for sources,
-    // we'll compute old_phys differently.
-
-    // For old_phys, we need the RAT mapping BEFORE this cycle's writes.
-    // Since rat read ports are combinational and happen before write,
-    // if we query dest_areg on the read ports we get the old value.
-    // But we're using all 4 read ports for sources.
-    // Alternative: We read dest_areg1 via rat_rd_sel1 or rat_rd_sel2 by re-purposing.
-    // Actually for correctness, we need the old phys mapping for the dest register.
-    // Let's leverage the fact that for most ALU instructions, src1=rs or rd already
-    // and for the destination register, we can get the old mapping from the source reads.
-
-    // Simplification: We'll track old_phys by noting that for instructions where
-    // dest_areg == one of the source aregs, we already have the mapping.
-    // For others, we can use a trick: read all 4 source mappings plus dest mappings
-    // by having the RAT maintain a separate read for dest. But our RAT only has 4 ports.
-
-    // Practical approach: old_phys is rat_table[dest_areg] BEFORE write.
-    // We'll wire the rat read ports as:
-    // But this cycle the sources may differ from dest...
-    // We need 6 RAT reads (src1_1, src2_1, src1_2, src2_2, dest1, dest2) but only have 4.
-    //
-    // COMPROMISE: For the first version, let's use the following approach:
-    // - Read src1, src2 for instr1 on ports 1,2
-    // - Read src1, src2 for instr2 on ports 3,4
-    // - For old_phys_rd: we know that in many cases dest == one of the sources
-    //   For the general case, we'll instantiate a small combinational lookup
-    //   directly from the RAT's internal table. But that breaks modularity.
-    //
-    // Better approach: We'll wire the RAT so that for instr1 we read:
-    //   port1 = src1_areg1, port2 = dest_areg1
-    //   and for instr2: port3 = src1_areg2, port4 = dest_areg2
-    //   Then we get old_phys from port2 and port4.
-    //   For src2, we read from the PRF using the phys tag from port1's mapping if needed.
-    //   But this makes the design more complex.
-    //
-    // SIMPLEST correct approach: Use ports for dest lookups.
-    //   port1 = src1_areg1 (or the primary source)
-    //   port2 = dest_areg1 (to get old_phys_rd1)
-    //   port3 = src1_areg2 (or the primary source)
-    //   port4 = dest_areg2 (to get old_phys_rd2)
-    //   Then for src2, read the PRF directly using the phys_tag from elsewhere.
-    //   But src2 phys tag comes from RAT... we don't have a port for it.
-    //
-    // FINAL DECISION: We'll use the 4 RAT ports as follows and handle src2 read
-    // by using the PRF read ports (4 ports) to cover all needs.
-    // Actually, the PRF has 4 read ports too.
-    // Let's do: RAT port1=src1_1, RAT port2=src2_1, RAT port3=src1_2, RAT port4=src2_2
-    // and for old_phys_rd, we use a registered snapshot approach:
-    // We read dest_areg from RAT using the combinational output BEFORE write.
-    // Since RAT is written at posedge clk but read combinationally,
-    // and our decode/rename logic is combinational (producing the write enables),
-    // the RAT reads happen before the writes. So if we could read dest_areg...
-    //
-    // OK - we actually need to add 2 more read ports or accept that we need
-    // a different approach. Let's just accept that for HALT and STORE (which
-    // don't write to rd), old_phys doesn't matter. For instructions that DO write,
-    // old_phys = current RAT[dest_areg] before the write.
-    //
-    // We'll reuse RAT reads: for instructions that write rd:
-    // - If dest_areg == one of our src aregs, we already have it
-    // - Otherwise we need a separate read
-    // For simplicity in this complex wiring, let's just wire the RAT reads
-    // slightly differently for each instruction type using muxes, and accept
-    // that one of the 2 src reads has to be done from PRF ready-bit-only path.
-
-    // PRAGMATIC SOLUTION: read old_phys via repurposed RAT ports.
-    // We'll redefine:
-    //   RAT port 1: for instr1 - read src1 areg
-    //   RAT port 2: for instr1 - read dest_areg1 (gives old_phys_rd1)
-    //   RAT port 3: for instr2 - read src1 areg
-    //   RAT port 4: for instr2 - read dest_areg2 (gives old_phys_rd2)
-    // Then src2 physical register = we need it from somewhere.
-    // For src2, we'll get the tag from the RAT read but we only have 4 ports.
-    //
-    // ACTUALLY: Let me re-read the modules. The PRF has 4 read ports.
-    // We can use PRF ports for the actual data reads and RAT ports for the tag lookups.
-    // But we need tags (phys reg IDs) from RAT before we can index into PRF.
-    //
-    // Let's take the simplest approach that works:
-    // ADD 2 MORE EFFECTIVE RAT READS by noting that the RAT is just a register array.
-    // Since we can't modify the RAT module, let's re-wire our 4 RAT read ports
-    // to be: {src1_1, dest_areg1, src1_2, dest_areg2}
-    // and derive src2 phys tags by checking intra-group deps or using the PRF read port.
-    //
-    // Actually wait - for src2, many instructions mark it as "don't care / ready".
-    // Let me re-read the spec more carefully:
-    // - NOT: src2 = don't care
-    // - MOV rd,rs: src2 = don't care
-    // - MOVI: src2 = don't care
-    // - BR: src2 = don't care
-    // - BRR: src2 = don't care
-    // - BRR L: both don't care
-    // - BRNZ: src1=rd, src2=rs
-    // - CALL: src1=rd, src2=r31
-    // - BRGT: src1=rd, src2=rs, (rt in imm)
-    // - ADDI/SUBI/SHFTRI/SHFTLI: src1=rd, src2=don't care
-    //
-    // For register-register ALU: src1=rs, src2=rt
-    // For FPU: src1=rs, src2=rt
-    // For LOAD: base=rs (only 1 source)
-    // For STORE: addr=rd, data=rs (2 sources, but separate queue)
-    //
-    // So we often only need 1-2 source tags per instruction. 4 ports total is tight.
-    //
-    // DEFINITIVE APPROACH:
-    // RAT port 1 = dest_areg1 (old_phys for instr1)
-    // RAT port 2 = src1_areg1 (primary source for instr1)
-    // RAT port 3 = dest_areg2 (old_phys for instr2)
-    // RAT port 4 = src1_areg2 (primary source for instr2)
-    // For src2: we note that src2_areg is typically rt (for reg-reg) or rs (for BRNZ/BRGT).
-    // We know the phys tag for rt or rs because of the rename order.
-    // We can get src2 tag by checking if src2_areg == dest_areg1 (intra-dep) -> use new_phys1
-    // Otherwise src2_areg's mapping = we read it by swapping mux on one RAT port during
-    // the subsequent cycle... No, that's multi-cycle.
-    //
-    // SIMPLEST CORRECT: Just use a separate always_comb to derive what we need.
-    // For a synthesizable design we'd add more RAT read ports.
-    // For this Verilog simulation, let's just use the 4 ports smartly.
-    //
-    // I'll use: port1=src1_areg1, port2=src2_areg1, port3=dest_areg1, port4=dest_areg2
-    // Then for instr2 sources, handle via intra-dep check against instr1's dest.
-    // For instr2 src1: if src1_areg2 == dest_areg1 and alloc_preg1 -> new_phys_rd1
-    //                  else -> same as rat_table[src1_areg2], which we DON'T have a port for
-    //
-    // This doesn't work either with only 4 ports...
-    //
-    // PRAGMATIC FINAL: Just wire 4 ports as originally planned and COMPUTE old_phys
-    // by checking if dest == any of the source aregs we already read.
-    // If dest_areg happens to be different from all sources, old_phys will be 0
-    // which means on commit we'll free preg 0, but preg 0 is architectural (r0)
-    // and should never be freed... Actually that's a bug.
-    //
-    // OK I need to stop overthinking this. The simplest solution:
-    // Wire RAT reads as: port1=dest_areg1, port2=dest_areg2, port3=src1_areg1_or_store, port4=src1_areg2_or_store
-    // For src2, use the PRF read ports to get ready bits but we need the TAG.
-    // We need the tag to put into the RS. Without the tag we can't do anything.
-    //
-    // REAL SOLUTION: We need 6 RAT read ports but only have 4. For this OOO core
-    // that dispatches 2 instructions/cycle, we truly need more.
-    // Let's modify our usage: decode 1 instruction at a time in the worst case,
-    // or accept that src2 tag for instr2 when it's different from src1 of any
-    // instruction requires a stall... No, that's too restrictive.
-    //
-    // ACTUAL PRAGMATIC SOLUTION FOR THIS SIMULATION:
-    // We have 4 RAT ports. We'll use them for:
-    //   Port 1: Instruction 1 source operand A (src1_areg1)
-    //   Port 2: Instruction 1 dest (dest_areg1) -> gives old_phys1
-    //   Port 3: Instruction 2 source operand A (src1_areg2)
-    //   Port 4: Instruction 2 dest (dest_areg2) -> gives old_phys2
-    // For source operand B (src2) tags, we note:
-    //   - Many instructions have src2 = don't care (mark ready)
-    //   - For reg-reg ALU/FPU (src2=rt): use the PHYSICAL register number
-    //     rat_table[rt]. We can derive this because if rt == dest_areg1,
-    //     it's new_phys1; if rt == src1_areg1, it's phys from port1;
-    //     if rt == dest_areg2, it's the old mapping from port4; etc.
-    //     In the general case we can't derive it...
-    //
-    // I will restructure: for instructions that need 2 real source reads,
-    // I'll encode src2_areg as one of the RAT ports and sacrifice
-    // something else. For STORE instructions which need addr+data from RAT,
-    // I'll pack them differently.
-    //
-    // DEFINITIVE FINAL APPROACH:
-    // I'll use the 4 RAT ports cycle by cycle and stall when I can't serve all reads.
-    // OR, more practically for this simulation project, I'll just add the
-    // old_phys lookup inline since the RAT is a simple array - I can read it
-    // by instantiating the RAT with extra read ports... but the RAT module only has 4.
-    //
-    // The correct engineering solution is to either:
-    // (a) Make the RAT have more read ports
-    // (b) Dispatch only 1 instruction when port contention happens
-    // (c) Pipeline the rename stage
-    //
-    // For this project, since I can't modify other modules, I'll go with approach (b):
-    // Use 4 RAT ports divided as:
-    //   Port 1: instr1 src1_areg
-    //   Port 2: instr1 src2_areg
-    //   Port 3: instr2 src1_areg
-    //   Port 4: instr2 src2_areg
-    // For old_phys:
-    //   old_phys1 can be computed: if dest_areg1 == src1_areg1 -> port1 result
-    //                              if dest_areg1 == src2_areg1 -> port2 result
-    //                              if dest_areg1 == src1_areg2 -> port3 result
-    //                              if dest_areg1 == src2_areg2 -> port4 result
-    //                              else -> stall (dispatch only instr1 as "special")
-    //   Actually for the common case, dest is rd which is often one of the source regs.
-    //   For reg-reg: dest=rd, src1=rs, src2=rt. rd might not be rs or rt.
-    //   Example: ADD rd, rs, rt. dest=rd != rs != rt. We can't get old_phys!
-    //
-    // This forces us to have more ports. Since I own the file, let me update the RAT
-    // to have 6 read ports... wait, the task says "Keep all other modules exactly as they are".
-    // Hmm. Actually re-reading: "Replace ONLY the tinker_core module".
-    //
-    // So I can't change the RAT. I need to work with 4 read ports.
-    //
-    // THE ANSWER: We use the 4 ports for src1+src2 of both instructions.
-    // For old_phys, we know that initially rat_table[i] = i for i < 32.
-    // After that, the mapping changes. But we can get old_phys by:
-    // Checking if dest_areg matches any of our 4 read ports' areg selectors.
-    // If yes -> use that port's result. If no -> we have a problem.
-    //
-    // For ADD rd, rs, rt: dest_areg=rd, src1_areg=rs, src2_areg=rt.
-    // rd != rs and rd != rt typically. So old_phys = rat[rd] is unknown.
-    //
-    // SOLUTION: Change the RAT read port assignments to INCLUDE dest:
-    //   Port 1: src1_areg1
-    //   Port 2: dest_areg1  (we get old_phys1 AND can compute src2 tag differently)
-    //   Port 3: src1_areg2
-    //   Port 4: dest_areg2
-    //
-    // For src2_tag: we mark it as not-ready with tag=phys_reg, but we don't know the phys_reg.
-    // Unless src2_areg == src1_areg (then we know), or src2_areg == dest_areg (then we know),
-    // or src2_areg == src1_areg_of_other_instr, etc.
-    //
-    // This is fundamentally broken with only 4 ports for 2-wide dispatch needing 6 reads.
-    //
-    // EXECUTIVE DECISION: I'll make the rename single-issue in the critical case,
-    // OR I'll repurpose the 4 PRF read ports to also provide tag lookups.
-    // Wait, PRF read ports take a 7-bit physical reg ID, not a 5-bit arch reg.
-    // They can't help with RAT lookups.
-    //
-    // CORRECT FINAL APPROACH: Rename uses 4 RAT ports as:
-    //   Port 1: dest_areg1 -> old_phys1
-    //   Port 2: dest_areg2 -> old_phys2_raw (before intra-dep)
-    //   Port 3: src_a_areg1 (varies by opcode)
-    //   Port 4: src_a_areg2 (varies by opcode)
-    // For src_b (the second source operand tag):
-    //   We handle this by reading the PRF for ready bits using the tag we CAN derive:
-    //   - If src_b is "don't care" -> mark ready
-    //   - If src_b_areg == dest_areg1 -> tag = old_phys1, or new_phys1 if alloc
-    //   - If src_b_areg == src_a_areg1 -> tag = same as port3
-    //   - If src_b_areg == dest_areg2 -> tag = old_phys2_raw or new
-    //   - If src_b_areg == src_a_areg2 -> tag = same as port4
-    //   - Otherwise: we dispatch the instruction with src_b marked NOT ready,
-    //     tag = 7'd0 (which will eventually match CDB), or we stall.
-    //     Actually this is wrong. We NEED the correct tag.
-    //
-    // I think the only truly correct solution without modifying the RAT module
-    // is to register the decode and do rename over 2 cycles, or dispatch 1 at a time.
-    // But that defeats the purpose of 2-wide.
-    //
-    // Let me re-read the RAT module... it has:
-    //   4 read ports, 2 write ports, snapshot, restore.
-    // And the read ports are purely combinational: assign read_preg1 = rat_table[read_sel1];
-    //
-    // I could instantiate TWO RAT modules in lockstep (same writes, same snapshot/restore)
-    // to effectively get 8 read ports. But that doubles the area and the task says
-    // "Keep all other modules exactly as they are" - meaning don't modify them,
-    // but I can instantiate multiple copies!
-    //
-    // That's the solution. I'll instantiate a second RAT copy for the extra 2 read ports.
-    // Both RAT copies get the same write/snapshot/restore signals so they stay in sync.
-
     // Forward declarations for old_phys lookups (from rat_extra)
     wire [6:0] old_phys1_raw, old_phys2_raw;
 
@@ -585,11 +324,11 @@ module tinker_core(
     // Decode stall conditions
     wire target_full1 = (is_alu1 && ((!alu_rr && rs_alu0_full) || (alu_rr && rs_alu1_full))) ||
                         (is_fpu1 && ((!fpu_rr && rs_fpu0_full) || (fpu_rr && rs_fpu1_full))) ||
-                        (is_load1 && lq_full) ||
+                        ((is_load1 || is_return1) && lq_full) ||
                         ((is_store1 || is_call1) && sq_full);
     wire target_full2 = (is_alu2 && ((!alu_rr_after1 && rs_alu0_full) || (alu_rr_after1 && rs_alu1_full))) ||
                         (is_fpu2 && ((!fpu_rr_after1 && rs_fpu0_full) || (fpu_rr_after1 && rs_fpu1_full))) ||
-                        (is_load2 && lq_full) ||
+                        ((is_load2 || is_return2) && lq_full) ||
                         ((is_store2 || is_call2) && sq_full);
 
     // After instr1 dispatches to an ALU/FPU RS, toggle RR for instr2
@@ -699,22 +438,6 @@ module tinker_core(
     wire [63:0] dispatch_imm1 = imm1;
     wire [63:0] dispatch_imm2 = imm2;
 
-    // For BRGT: rt value goes in imm field if we can read it
-    // Since we only have 2 src reads per instruction, for BRGT we put the
-    // rt comparison value in the imm field. The alu_pipe handles BRGT as
-    // issue_src2 > issue_imm. So for BRGT, src2=rs mapped, imm=rt_value.
-    // But we don't have rt's value readily... we read src1=rd, src2=rs.
-    // rt's phys reg is rat[rt]. We'd need a 3rd source read.
-    // For simplicity, we'll put rt's phys tag in imm and let the ALU pipe
-    // handle it. But the ALU pipe expects the actual VALUE in imm for BRGT.
-    // This is a limitation. For now, pass 0 and accept BRGT may not work
-    // correctly in all cases until more read ports are added.
-    // Actually, re-reading the alu_pipe: BRGT uses issue_src2 > issue_imm.
-    // So we need rt's VALUE in the imm field. If we mark it not-ready in RS,
-    // the RS will snoop CDB... but RS imm field is not snoopable.
-    // For BRGT with 2 read ports, we would need to handle this specially.
-    // For now, we'll read rt's value at dispatch if ready, else pass 0.
-    // This is a known limitation.
 
     // ================================================================
     // RS dispatch data muxes
@@ -786,9 +509,16 @@ module tinker_core(
     wire        sq_disp_from1 = disp1_to_sq;
     // For normal STORE: addr_base = rd's phys, data = rs's phys
     // For CALL: addr_base = r31's phys, data = PC+4 (immediate, mark ready)
-    wire [63:0] sq_disp_addr_base_val = sq_disp_from1 ? src1_val1 : src1_val2;
-    wire [6:0]  sq_disp_addr_base_tag = sq_disp_from1 ? prf_rd1 : prf_rd3;
-    wire        sq_disp_addr_base_rdy = sq_disp_from1 ? src1_rdy1 : src1_rdy2;
+    // For CALL: addr_base = r31 (src2), not rd (src1)
+    wire [63:0] sq_disp_addr_base_val = sq_disp_from1 ?
+                                        (is_call1 ? src2_val1 : src1_val1) :
+                                        (is_call2 ? src2_val2 : src1_val2);
+    wire [6:0]  sq_disp_addr_base_tag = sq_disp_from1 ?
+                                        (is_call1 ? prf_rd2 : prf_rd1) :
+                                        (is_call2 ? prf_rd4 : prf_rd3);
+    wire        sq_disp_addr_base_rdy = sq_disp_from1 ?
+                                        (is_call1 ? src2_rdy1 : src1_rdy1) :
+                                        (is_call2 ? src2_rdy2 : src1_rdy2);
     wire [63:0] sq_disp_data_val = sq_disp_from1 ?
                                    (is_call1 ? (fu_out_pc1 + 64'd4) : src2_val1) :
                                    (is_call2 ? (fu_out_pc2 + 64'd4) : src2_val2);
@@ -807,13 +537,13 @@ module tinker_core(
     // ================================================================
     // ROB allocation data
     // ================================================================
-    wire [2:0] rob_type1 = is_branch1 ? ITYPE_BRANCH :
+    wire [2:0] rob_type1 = (is_branch1 || is_return1) ? ITYPE_BRANCH :
                            is_fpu1    ? ITYPE_FPU :
                            is_load1   ? ITYPE_LOAD :
                            (is_store1_only || is_call1) ? (is_call1 ? ITYPE_BRANCH : ITYPE_STORE) :
                            is_halt1   ? ITYPE_HALT :
                            ITYPE_ALU;
-    wire [2:0] rob_type2 = is_branch2 ? ITYPE_BRANCH :
+    wire [2:0] rob_type2 = (is_branch2 || is_return2) ? ITYPE_BRANCH :
                            is_fpu2    ? ITYPE_FPU :
                            is_load2   ? ITYPE_LOAD :
                            (is_store2_only || is_call2) ? (is_call2 ? ITYPE_BRANCH : ITYPE_STORE) :
@@ -830,8 +560,8 @@ module tinker_core(
     reg [1:0] snap_id_counter;
     wire [1:0] snap_id1 = snap_id_counter;
     wire [1:0] snap_id2 = snap_id_counter + 2'd1;
-    wire take_snap1 = dispatch_valid1 && is_branch1;
-    wire take_snap2 = dispatch_valid2 && is_branch2;
+    wire take_snap1 = dispatch_valid1 && (is_branch1 || is_return1);
+    wire take_snap2 = dispatch_valid2 && (is_branch2 || is_return2);
 
     // ================================================================
     // Sequential logic: RR counters, snapshot ID, halt
@@ -947,10 +677,12 @@ module tinker_core(
         .write_en2(alloc_preg2 && dispatch_valid2),
         .write_areg2(dest_areg2),
         .write_preg2(new_phys_rd2),
-        .snap_en(take_snap1 || take_snap2),
-        .snap_id(take_snap1 ? snap_id1 : snap_id2),
+        .snap_en1(take_snap1),
+        .snap_id1(snap_id1),
+        .snap_en2(take_snap2),
+        .snap_id2(snap_id2),
         .restore_en(flush),
-        .restore_id(2'd0)  // simplified: always restore from snapshot 0
+        .restore_id(rob_mispredict_snap_id)
     );
 
     // --- RAT extra (for old_phys lookups and any additional src2 reads) ---
@@ -972,10 +704,12 @@ module tinker_core(
         .write_en2(alloc_preg2 && dispatch_valid2),
         .write_areg2(dest_areg2),
         .write_preg2(new_phys_rd2),
-        .snap_en(take_snap1 || take_snap2),
-        .snap_id(take_snap1 ? snap_id1 : snap_id2),
+        .snap_en1(take_snap1),
+        .snap_id1(snap_id1),
+        .snap_en2(take_snap2),
+        .snap_id2(snap_id2),
         .restore_en(flush),
-        .restore_id(2'd0)
+        .restore_id(rob_mispredict_snap_id)
     );
 
     assign old_phys1_raw = rat_extra_preg1;
@@ -1004,8 +738,12 @@ module tinker_core(
         .enq_en2(rob_commit_en2 && rob_commit_type2 != ITYPE_STORE && rob_commit_type2 != ITYPE_HALT),
         .enq_preg2(rob_commit_old_phys2),
         .can_alloc2(fl_can_alloc2),
+        .snap_en1(take_snap1),
+        .snap_id1(snap_id1),
+        .snap_en2(take_snap2),
+        .snap_id2(snap_id2),
         .restore_en(flush),
-        .restore_head(7'd0)  // simplified restore
+        .restore_id(rob_mispredict_snap_id)
     );
 
     // --- Physical Register File ---
@@ -1203,6 +941,7 @@ module tinker_core(
         .br_taken(alu0_br_taken),
         .br_target(alu0_br_target),
         .br_rob_idx_out(alu0_br_rob_idx),
+        .cdb_stall(cdb_alu0_stall),
         .flush(flush)
     );
 
@@ -1225,39 +964,37 @@ module tinker_core(
         .br_taken(alu1_br_taken),
         .br_target(alu1_br_target),
         .br_rob_idx_out(alu1_br_rob_idx),
+        .cdb_stall(cdb_alu1_stall),
         .flush(flush)
     );
 
-    // --- FPU Pipes ---
-    fpu_pipe fpu_pipe0(
+    // --- FPU (wrapper containing both FPU pipes) ---
+    fpu fpu(
         .clk(clk), .rst(reset),
-        .issue_valid(rs_fpu0_issue_valid),
-        .issue_opcode(rs_fpu0_issue_opcode),
-        .issue_src1(rs_fpu0_issue_src1),
-        .issue_src2(rs_fpu0_issue_src2),
-        .issue_dest_tag(rs_fpu0_issue_dest),
-        .issue_rob_idx(rs_fpu0_issue_rob),
-        .issue_ready(fpu0_issue_ready),
-        .cdb_valid(fpu0_cdb_valid),
-        .cdb_tag(fpu0_cdb_tag),
-        .cdb_value(fpu0_cdb_value),
-        .cdb_rob_idx(fpu0_cdb_rob),
-        .flush(flush)
-    );
-
-    fpu_pipe fpu_pipe1(
-        .clk(clk), .rst(reset),
-        .issue_valid(rs_fpu1_issue_valid),
-        .issue_opcode(rs_fpu1_issue_opcode),
-        .issue_src1(rs_fpu1_issue_src1),
-        .issue_src2(rs_fpu1_issue_src2),
-        .issue_dest_tag(rs_fpu1_issue_dest),
-        .issue_rob_idx(rs_fpu1_issue_rob),
-        .issue_ready(fpu1_issue_ready),
-        .cdb_valid(fpu1_cdb_valid),
-        .cdb_tag(fpu1_cdb_tag),
-        .cdb_value(fpu1_cdb_value),
-        .cdb_rob_idx(fpu1_cdb_rob),
+        .pipe0_issue_valid(rs_fpu0_issue_valid),
+        .pipe0_issue_opcode(rs_fpu0_issue_opcode),
+        .pipe0_issue_src1(rs_fpu0_issue_src1),
+        .pipe0_issue_src2(rs_fpu0_issue_src2),
+        .pipe0_issue_dest_tag(rs_fpu0_issue_dest),
+        .pipe0_issue_rob_idx(rs_fpu0_issue_rob),
+        .pipe0_issue_ready(fpu0_issue_ready),
+        .pipe0_cdb_valid(fpu0_cdb_valid),
+        .pipe0_cdb_tag(fpu0_cdb_tag),
+        .pipe0_cdb_value(fpu0_cdb_value),
+        .pipe0_cdb_rob_idx(fpu0_cdb_rob),
+        .pipe1_issue_valid(rs_fpu1_issue_valid),
+        .pipe1_issue_opcode(rs_fpu1_issue_opcode),
+        .pipe1_issue_src1(rs_fpu1_issue_src1),
+        .pipe1_issue_src2(rs_fpu1_issue_src2),
+        .pipe1_issue_dest_tag(rs_fpu1_issue_dest),
+        .pipe1_issue_rob_idx(rs_fpu1_issue_rob),
+        .pipe1_issue_ready(fpu1_issue_ready),
+        .pipe1_cdb_valid(fpu1_cdb_valid),
+        .pipe1_cdb_tag(fpu1_cdb_tag),
+        .pipe1_cdb_value(fpu1_cdb_value),
+        .pipe1_cdb_rob_idx(fpu1_cdb_rob),
+        .pipe0_cdb_stall(cdb_fpu0_stall),
+        .pipe1_cdb_stall(cdb_fpu1_stall),
         .flush(flush)
     );
 
@@ -1283,6 +1020,11 @@ module tinker_core(
         .cdb_tag(lq_cdb_tag),
         .cdb_value(lq_cdb_value),
         .cdb_rob_idx(lq_cdb_rob),
+        .br_resolved(lq_br_resolved),
+        .br_taken(lq_br_taken),
+        .br_target(lq_br_target),
+        .br_rob_idx_out(lq_br_rob_idx),
+        .cdb_stall(cdb_lsu0_stall),
         .full(lq_full),
         .flush(flush)
     );
@@ -1332,6 +1074,7 @@ module tinker_core(
         .alloc_pc1(fu_out_pc1),
         .alloc_branch_pred1(branch_pred1),
         .alloc_branch_target1(64'd0),  // predict not-taken, target=0
+        .alloc_snap_id1(snap_id1),
         .alloc_idx1(rob_alloc_idx1),
         .alloc_en2(dispatch_valid2),
         .alloc_type2(rob_type2),
@@ -1341,6 +1084,7 @@ module tinker_core(
         .alloc_pc2(fu_out_pc2),
         .alloc_branch_pred2(branch_pred2),
         .alloc_branch_target2(64'd0),
+        .alloc_snap_id2(snap_id2),
         .alloc_idx2(rob_alloc_idx2),
         .cdb0_valid(cdb0_valid),
         .cdb0_rob_idx(cdb0_rob),
@@ -1361,6 +1105,7 @@ module tinker_core(
         .mispredict(rob_mispredict),
         .mispredict_target(rob_mispredict_target),
         .mispredict_rob_idx(rob_mispredict_rob_idx),
+        .mispredict_snap_id(rob_mispredict_snap_id),
         .flush_all(rob_flush_all),
         .commit_en1(rob_commit_en1),
         .commit_type1(rob_commit_type1),
@@ -1629,14 +1374,22 @@ module free_list(
     input [6:0] enq_preg2,
     // Status
     output can_alloc2,
+    // Snapshot (2 ports for dual-issue branches)
+    input snap_en1,
+    input [1:0] snap_id1,
+    input snap_en2,
+    input [1:0] snap_id2,
     // Misprediction restore
     input restore_en,
-    input [6:0] restore_head
+    input [1:0] restore_id
 );
     reg [6:0] fifo [0:127];
     reg [6:0] head;
     reg [6:0] tail;
     reg [7:0] cnt; // 8-bit to hold 0..128
+
+    // 4 snapshot slots for head pointer
+    reg [6:0] snap_head [0:3];
 
     assign deq_preg1 = fifo[head];
     assign deq_preg2 = fifo[head + 7'd1];
@@ -1657,13 +1410,20 @@ module free_list(
             tail <= 7'd96;
             cnt <= 8'd96;
         end else if (restore_en) begin
-            head <= restore_head;
-            // Recalculate count: entries from restore_head to tail
-            if (tail >= restore_head)
-                cnt <= {1'b0, tail} - {1'b0, restore_head};
+            head <= snap_head[restore_id];
+            // Recalculate count: entries from restored head to tail
+            if (tail >= snap_head[restore_id])
+                cnt <= {1'b0, tail} - {1'b0, snap_head[restore_id]};
             else
-                cnt <= 8'd128 - {1'b0, restore_head} + {1'b0, tail};
+                cnt <= 8'd128 - {1'b0, snap_head[restore_id]} + {1'b0, tail};
         end else begin
+            // Take snapshots: capture head AFTER this instruction's own dequeue
+            if (snap_en1)
+                snap_head[snap_id1] <= deq_en1 ? (head + 7'd1) : head;
+            if (snap_en2) begin
+                // Slot 2's snapshot reflects head after both slot 1 and slot 2 dequeues
+                snap_head[snap_id2] <= head + (deq_en1 ? 7'd1 : 7'd0) + (deq_en2 ? 7'd1 : 7'd0);
+            end
             // Compute deq and enq counts
             // Dequeue (advance head)
             if (deq_en1 && deq_en2) begin
@@ -1713,9 +1473,11 @@ module rat(
     input write_en2,
     input [4:0] write_areg2,
     input [6:0] write_preg2,
-    // Snapshot
-    input snap_en,
-    input [1:0] snap_id,
+    // Snapshot (2 ports for dual-issue branches)
+    input snap_en1,
+    input [1:0] snap_id1,
+    input snap_en2,
+    input [1:0] snap_id2,
     // Restore
     input restore_en,
     input [1:0] restore_id
@@ -1758,13 +1520,24 @@ module rat(
             if (write_en1) begin
                 rat_table[write_areg1] <= write_preg1;
             end
-            // Take snapshot after writes
-            if (snap_en) begin
-                snap_base = {snap_id, 5'b0};
+            // Take snapshot 1 (for branch in slot 1): captures state after slot 1's rename only
+            if (snap_en1) begin
+                snap_base = {snap_id1, 5'b0};
                 for (i = 0; i < 32; i = i + 1) begin
                     snap_store[snap_base + i] <= rat_table[i];
                 end
-                // Also capture any writes happening this cycle
+                // Include slot 1's write only
+                if (write_en1) begin
+                    snap_store[snap_base + write_areg1] <= write_preg1;
+                end
+            end
+            // Take snapshot 2 (for branch in slot 2): captures state after both slots' renames
+            if (snap_en2) begin
+                snap_base = {snap_id2, 5'b0};
+                for (i = 0; i < 32; i = i + 1) begin
+                    snap_store[snap_base + i] <= rat_table[i];
+                end
+                // Include both writes (en1 overrides en2 on conflict)
                 if (write_en2) begin
                     snap_store[snap_base + write_areg2] <= write_preg2;
                 end
@@ -1997,6 +1770,7 @@ module alu_pipe(
     output reg [63:0] br_target,
     output reg [4:0] br_rob_idx_out,
 
+    input cdb_stall,
     input flush
 );
 
@@ -2175,12 +1949,13 @@ module alu_pipe(
                 s1_brtgt_next = 64'd0;
                 s1_taken_next = 1'b1;
             end
-            5'h0e: begin // BRGT rd, rs, rt -> target = src1, taken = (src2 > imm)
+            5'h0e: begin // BRGT rd, rs, rt -> src1=rs, src2=rt, target=PC+imm(rd), taken=(src1 > src2)
                 s1_cat_next = CAT_BRANCH; s1_sub_next = SUB_BRGT;
                 s1_isbr_next = 1'b1; s1_hasres_next = 1'b0;
-                s1_brtgt_next = issue_src1;
-                // Condition evaluation in stage 1
-                s1_taken_next = (issue_src2 > issue_imm);
+                // Target = rd via imm encoding (L field used as offset from PC)
+                s1_opa_next = issue_imm; s1_opb_next = issue_pc;
+                // Condition: rs > rt (src1 > src2)
+                s1_taken_next = (issue_src1 > issue_src2);
             end
 
             // --- Move ---
@@ -2205,7 +1980,8 @@ module alu_pipe(
         endcase
     end
 
-    assign issue_ready = !s1_valid || flush;
+    // Can accept new issue when stage 1 is free and not held by CDB backpressure
+    assign issue_ready = (!s1_valid && !cdb_stall) || flush;
 
     // ========================================================================
     // Stage 2 combinational logic: Execute / Result Generation
@@ -2254,7 +2030,8 @@ module alu_pipe(
                     SUB_BRRL: s2_brtgt_comb = s1_operand_a + s1_operand_b; // imm + pc
                     SUB_CALL: s2_result_comb = s1_operand_a - s1_operand_b; // src2 - 8
                     SUB_RET:  s2_result_comb = s1_operand_a - s1_operand_b; // src1 - 8
-                    default: ; // BR, BRNZ, BRGT: target already in s1_br_target
+                    SUB_BRGT: s2_brtgt_comb = s1_operand_a + s1_operand_b; // imm + pc
+                    default: ; // BR, BRNZ: target already in s1_br_target
                 endcase
             end
 
@@ -2278,6 +2055,9 @@ module alu_pipe(
             s1_valid    <= 1'b0;
             cdb_valid   <= 1'b0;
             br_resolved <= 1'b0;
+        end else if (cdb_stall) begin
+            // Hold all outputs when CDB is stalled - don't advance pipeline
+            // Stage 1 and CDB outputs remain as-is
         end else begin
             // ---- Latch into Stage 1 registers (Decode/Operand Prep) ----
             s1_valid <= issue_valid && issue_ready;
@@ -2332,6 +2112,7 @@ module fpu_pipe(
     output reg [63:0] cdb_value,
     output reg [4:0] cdb_rob_idx,
 
+    input cdb_stall,
     input flush
 );
 
@@ -2361,7 +2142,8 @@ module fpu_pipe(
     // Pipeline occupancy — 5 stages
     // ========================================================================
     reg s1_valid, s2_valid, s3_valid, s4_valid, s5_valid;
-    assign issue_ready = !s1_valid || flush;
+    // Can accept when stage 1 free and not held by CDB backpressure
+    assign issue_ready = (!s1_valid && !cdb_stall) || flush;
 
     // ========================================================================
     // STAGE 1 — Unpack / Decode / Special-case detection
@@ -2933,6 +2715,8 @@ module fpu_pipe(
             s4_valid  <= 1'b0;
             s5_valid  <= 1'b0;
             cdb_valid <= 1'b0;
+        end else if (cdb_stall) begin
+            // Hold all pipeline state when CDB is stalled
         end else begin
             // ---- Latch issue into Stage 1 ----
             s1_valid <= issue_valid && issue_ready;
@@ -3016,6 +2800,80 @@ module fpu_pipe(
 endmodule
 
 // ============================================================================
+// FPU Wrapper (contains both FPU pipe instances)
+// ============================================================================
+module fpu(
+    input clk,
+    input rst,
+
+    // FPU pipe 0
+    input        pipe0_issue_valid,
+    input [4:0]  pipe0_issue_opcode,
+    input [63:0] pipe0_issue_src1,
+    input [63:0] pipe0_issue_src2,
+    input [6:0]  pipe0_issue_dest_tag,
+    input [4:0]  pipe0_issue_rob_idx,
+    output       pipe0_issue_ready,
+    output       pipe0_cdb_valid,
+    output [6:0] pipe0_cdb_tag,
+    output [63:0] pipe0_cdb_value,
+    output [4:0] pipe0_cdb_rob_idx,
+
+    // FPU pipe 1
+    input        pipe1_issue_valid,
+    input [4:0]  pipe1_issue_opcode,
+    input [63:0] pipe1_issue_src1,
+    input [63:0] pipe1_issue_src2,
+    input [6:0]  pipe1_issue_dest_tag,
+    input [4:0]  pipe1_issue_rob_idx,
+    output       pipe1_issue_ready,
+    output       pipe1_cdb_valid,
+    output [6:0] pipe1_cdb_tag,
+    output [63:0] pipe1_cdb_value,
+    output [4:0] pipe1_cdb_rob_idx,
+
+    input pipe0_cdb_stall,
+    input pipe1_cdb_stall,
+    input flush
+);
+
+    fpu_pipe fpu_pipe0(
+        .clk(clk), .rst(rst),
+        .issue_valid(pipe0_issue_valid),
+        .issue_opcode(pipe0_issue_opcode),
+        .issue_src1(pipe0_issue_src1),
+        .issue_src2(pipe0_issue_src2),
+        .issue_dest_tag(pipe0_issue_dest_tag),
+        .issue_rob_idx(pipe0_issue_rob_idx),
+        .issue_ready(pipe0_issue_ready),
+        .cdb_valid(pipe0_cdb_valid),
+        .cdb_tag(pipe0_cdb_tag),
+        .cdb_value(pipe0_cdb_value),
+        .cdb_rob_idx(pipe0_cdb_rob_idx),
+        .cdb_stall(pipe0_cdb_stall),
+        .flush(flush)
+    );
+
+    fpu_pipe fpu_pipe1(
+        .clk(clk), .rst(rst),
+        .issue_valid(pipe1_issue_valid),
+        .issue_opcode(pipe1_issue_opcode),
+        .issue_src1(pipe1_issue_src1),
+        .issue_src2(pipe1_issue_src2),
+        .issue_dest_tag(pipe1_issue_dest_tag),
+        .issue_rob_idx(pipe1_issue_rob_idx),
+        .issue_ready(pipe1_issue_ready),
+        .cdb_valid(pipe1_cdb_valid),
+        .cdb_tag(pipe1_cdb_tag),
+        .cdb_value(pipe1_cdb_value),
+        .cdb_rob_idx(pipe1_cdb_rob_idx),
+        .cdb_stall(pipe1_cdb_stall),
+        .flush(flush)
+    );
+
+endmodule
+
+// ============================================================================
 // Task 9: Load Queue (8 entries)
 // ============================================================================
 module load_queue(
@@ -3055,6 +2913,15 @@ module load_queue(
     output reg [63:0] cdb_value,
     output reg [4:0] cdb_rob_idx,
 
+    // Branch resolution (for RETURN instructions)
+    output reg br_resolved,
+    output reg br_taken,
+    output reg [63:0] br_target,
+    output reg [4:0] br_rob_idx_out,
+
+    // CDB backpressure
+    input cdb_stall,
+
     // Status
     output full,
     input flush
@@ -3072,6 +2939,7 @@ module load_queue(
     reg [4:0] lq_opcode [0:NUM_ENTRIES-1];
     reg lq_addr_computed [0:NUM_ENTRIES-1];
     reg [63:0] lq_addr [0:NUM_ENTRIES-1];
+    reg [63:0] lq_mem_data [0:NUM_ENTRIES-1]; // loaded data from memory
     reg lq_done [0:NUM_ENTRIES-1];
     reg [4:0] lq_age [0:NUM_ENTRIES-1];
 
@@ -3159,8 +3027,10 @@ module load_queue(
             end
             age_counter <= 0;
             cdb_valid <= 0;
+            br_resolved <= 0;
         end else begin
             cdb_valid <= 0;
+            br_resolved <= 0;
 
             // CDB snoop: update base values
             for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
@@ -3184,22 +3054,32 @@ module load_queue(
                 end
             end
 
-            // Memory read completion: mark done
+            // Memory read completion: mark done, store loaded data separately
             if (read_found) begin
                 if (sq_fwd_valid) begin
-                    lq_base_val[read_slot] <= sq_fwd_data; // reuse base_val to store loaded data
+                    lq_mem_data[read_slot] <= sq_fwd_data;
                     lq_done[read_slot] <= 1;
                 end else begin
-                    lq_base_val[read_slot] <= mem_read_data;
+                    lq_mem_data[read_slot] <= mem_read_data;
                     lq_done[read_slot] <= 1;
                 end
             end
 
-            // CDB output and free entry
-            if (cdb_found) begin
+            // CDB output and free entry (respect backpressure)
+            if (cdb_found && !cdb_stall) begin
                 cdb_valid <= 1;
                 cdb_tag <= lq_dest_tag[cdb_slot];
-                cdb_value <= lq_base_val[cdb_slot]; // loaded data stored here
+                // RETURN: CDB value = address (r31-8) for r31 update; branch target = loaded data
+                // Regular load: CDB value = loaded data
+                if (lq_opcode[cdb_slot] == 5'h0d) begin
+                    cdb_value <= lq_addr[cdb_slot]; // r31 - 8
+                    br_resolved <= 1;
+                    br_taken <= 1;
+                    br_target <= lq_mem_data[cdb_slot]; // loaded return address
+                    br_rob_idx_out <= lq_rob_idx[cdb_slot];
+                end else begin
+                    cdb_value <= lq_mem_data[cdb_slot]; // loaded data
+                end
                 cdb_rob_idx <= lq_rob_idx[cdb_slot];
                 lq_valid[cdb_slot] <= 0;
             end
@@ -3453,6 +3333,7 @@ module rob(
     input  wire [63:0] alloc_pc1,
     input  wire        alloc_branch_pred1,
     input  wire [63:0] alloc_branch_target1,
+    input  wire [1:0]  alloc_snap_id1,
     output wire [4:0]  alloc_idx1,
 
     // Allocate port 2
@@ -3464,6 +3345,7 @@ module rob(
     input  wire [63:0] alloc_pc2,
     input  wire        alloc_branch_pred2,
     input  wire [63:0] alloc_branch_target2,
+    input  wire [1:0]  alloc_snap_id2,
     output wire [4:0]  alloc_idx2,
 
     // CDB completion bus 0
@@ -3494,6 +3376,7 @@ module rob(
     output reg         mispredict,
     output reg  [63:0] mispredict_target,
     output reg  [4:0]  mispredict_rob_idx,
+    output reg  [1:0]  mispredict_snap_id,
     output reg         flush_all,
 
     // Commit port 1
@@ -3546,6 +3429,7 @@ module rob(
     reg        store_addr_rdy [0:DEPTH-1];
     reg        store_data_rdy [0:DEPTH-1];
     reg [63:0] result         [0:DEPTH-1];
+    reg [1:0]  snap_id        [0:DEPTH-1];
 
     reg [4:0] head, tail;
     reg [5:0] count;
@@ -3576,6 +3460,7 @@ module rob(
             flush_all <= 0;
             mispredict_target <= 0;
             mispredict_rob_idx <= 0;
+            mispredict_snap_id <= 0;
             commit_en1 <= 0;
             commit_en2 <= 0;
             halt_committed <= 0;
@@ -3592,6 +3477,11 @@ module rob(
             flush_all <= 0;
             commit_en1 <= 0;
             commit_en2 <= 0;
+
+            // Track whether a mispredict fires this cycle (blocking var for alloc guard)
+            begin : mispredict_guard
+                reg this_cycle_flush;
+                this_cycle_flush = 0;
 
             // --- CDB completion ---
             if (cdb0_valid && valid[cdb0_rob_idx]) begin
@@ -3625,7 +3515,9 @@ module rob(
                     (br_taken && (branch_target_pred[br_rob_idx] != br_target))) begin
                     mispredict <= 1;
                     mispredict_rob_idx <= br_rob_idx;
+                    mispredict_snap_id <= snap_id[br_rob_idx];
                     flush_all <= 1;
+                    this_cycle_flush = 1;
                     // Redirect target: if taken, go to actual target; if not taken, pc+4
                     mispredict_target <= br_taken ? br_target : (pc[br_rob_idx] + 64'd4);
 
@@ -3637,9 +3529,9 @@ module rob(
                         end
                     end
 
-                    // Update tail and count
+                    // Update tail and count (use 5-bit subtraction for circular distance)
                     tail <= br_rob_idx + 5'd1;
-                    count <= {1'b0, br_rob_idx} - {1'b0, head} + 6'd1;
+                    count <= {1'b0, (br_rob_idx - head)} + 6'd1;
                 end
             end
 
@@ -3716,7 +3608,8 @@ module rob(
             end
 
             // --- Allocate (after commit to allow same-cycle free/alloc) ---
-            if (alloc_en1 && !flush_all) begin
+            // Suppress alloc when mispredict detected this cycle
+            if (alloc_en1 && !this_cycle_flush) begin
                 valid[tail] <= 1;
                 complete[tail] <= 0;
                 itype[tail] <= alloc_type1;
@@ -3726,6 +3619,7 @@ module rob(
                 pc[tail] <= alloc_pc1;
                 branch_pred[tail] <= alloc_branch_pred1;
                 branch_target_pred[tail] <= alloc_branch_target1;
+                snap_id[tail] <= alloc_snap_id1;
                 branch_resolved_flag[tail] <= 0;
                 store_addr_rdy[tail] <= 0;
                 store_data_rdy[tail] <= 0;
@@ -3740,6 +3634,7 @@ module rob(
                     pc[tail + 5'd1] <= alloc_pc2;
                     branch_pred[tail + 5'd1] <= alloc_branch_pred2;
                     branch_target_pred[tail + 5'd1] <= alloc_branch_target2;
+                    snap_id[tail + 5'd1] <= alloc_snap_id2;
                     branch_resolved_flag[tail + 5'd1] <= 0;
                     store_addr_rdy[tail + 5'd1] <= 0;
                     store_data_rdy[tail + 5'd1] <= 0;
@@ -3751,6 +3646,7 @@ module rob(
                     count <= count + 6'd1;
                 end
             end
+            end // mispredict_guard
         end
     end
 
@@ -3968,7 +3864,7 @@ module cdb_arbiter(
 
 endmodule
 
-module fpu(input [63:0] f, output nan, output infinity, output zero, output subnormal, output normal);
+module fpu_class(input [63:0] f, output nan, output infinity, output zero, output subnormal, output normal);
     wire expOnes = &f[62:52];
     wire expZero = ~|f[62:52];
     wire fracZero = ~|f[51:0];
@@ -3984,8 +3880,8 @@ module fpu_mul(input [63:0] a, input [63:0] b, output reg [63:0] result);
     wire aNan, aInf, aZero, aSubnormal, aNormal;
     wire bNan, bInf, bZero, bSubnormal, bNormal;
 
-    fpu classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
-    fpu classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
+    fpu_class classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
+    fpu_class classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
 
     function [5:0] count_leading_zeros(input [52:0] sig);
         integer i;
@@ -4093,8 +3989,8 @@ module fpu_add(input [63:0] a, input [63:0] b, output reg [63:0] result);
     wire aNan, aInf, aZero, aSubnormal, aNormal;
     wire bNan, bInf, bZero, bSubnormal, bNormal;
 
-    fpu classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
-    fpu classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
+    fpu_class classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
+    fpu_class classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
 
     function [5:0] count_leading_zeros(input [55:0] sig);
         integer i;
@@ -4274,8 +4170,8 @@ module fpu_div(input [63:0] a, input [63:0] b, output reg [63:0] result);
     wire aNan, aInf, aZero, aSubnormal, aNormal;
     wire bNan, bInf, bZero, bSubnormal, bNormal;
 
-    fpu classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
-    fpu classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
+    fpu_class classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
+    fpu_class classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
 
     function [5:0] count_leading_zeros(input [52:0] sig);
         integer i;
