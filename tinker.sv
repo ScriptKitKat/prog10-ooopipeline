@@ -878,7 +878,7 @@ module tinker_core(
     wire [63:0] lq_mem_read_data_wire;
 
     // --- Memory ---
-    memory mem_inst(
+    memory memory(
         .clk(clk),
         .reset(reset),
         .PC(64'd0),                          // legacy port, tied off
@@ -1047,7 +1047,7 @@ module tinker_core(
     wire arf_same_dest = arf_wen1_raw && arf_wen2_raw &&
                          (rob_commit_arch_rd1 == rob_commit_arch_rd2);
     // Suppress older write (port 1) when both write same register
-    reg_file arf_inst(
+    reg_file reg_file(
         .clk(clk),
         .reset(reset),
         .write_en1(arf_wen1_raw && !arf_same_dest),
@@ -3968,7 +3968,7 @@ module cdb_arbiter(
 
 endmodule
 
-module fpu_class(input [63:0] f, output nan, output infinity, output zero, output subnormal, output normal);
+module fpu(input [63:0] f, output nan, output infinity, output zero, output subnormal, output normal);
     wire expOnes = &f[62:52];
     wire expZero = ~|f[62:52];
     wire fracZero = ~|f[51:0];
@@ -3984,8 +3984,8 @@ module fpu_mul(input [63:0] a, input [63:0] b, output reg [63:0] result);
     wire aNan, aInf, aZero, aSubnormal, aNormal;
     wire bNan, bInf, bZero, bSubnormal, bNormal;
 
-    fpu_class classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
-    fpu_class classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
+    fpu classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
+    fpu classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
 
     function [5:0] count_leading_zeros(input [52:0] sig);
         integer i;
@@ -4093,8 +4093,8 @@ module fpu_add(input [63:0] a, input [63:0] b, output reg [63:0] result);
     wire aNan, aInf, aZero, aSubnormal, aNormal;
     wire bNan, bInf, bZero, bSubnormal, bNormal;
 
-    fpu_class classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
-    fpu_class classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
+    fpu classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
+    fpu classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
 
     function [5:0] count_leading_zeros(input [55:0] sig);
         integer i;
@@ -4274,8 +4274,8 @@ module fpu_div(input [63:0] a, input [63:0] b, output reg [63:0] result);
     wire aNan, aInf, aZero, aSubnormal, aNormal;
     wire bNan, bInf, bZero, bSubnormal, bNormal;
 
-    fpu_class classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
-    fpu_class classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
+    fpu classA(.f(a), .nan(aNan), .infinity(aInf), .zero(aZero), .subnormal(aSubnormal), .normal(aNormal));
+    fpu classB(.f(b), .nan(bNan), .infinity(bInf), .zero(bZero), .subnormal(bSubnormal), .normal(bNormal));
 
     function [5:0] count_leading_zeros(input [52:0] sig);
         integer i;
@@ -4404,7 +4404,7 @@ module fpu_div(input [63:0] a, input [63:0] b, output reg [63:0] result);
 endmodule
 
 
-module ALU(
+module alu(
     input [4:0] opcode,
     input [63:0] PC,
     input [63:0] rd_data,
