@@ -193,8 +193,8 @@ module test_all;
         store_instr(64'h2000, mk_instr(5'h12, 5'd1, 5'd0, 5'd0, 12'd5));
         store_instr(64'h2004, mk_instr(5'h0f, 5'd0, 5'd0, 5'd0, 12'd0));
         run_test("mov_L_to_reg");
-        // MOVI: result = {imm[11:0], src1[51:0]} = {5, 0[51:0]} = 5 << 52
-        check("mov_L_to_reg", 1, {12'd5, 52'd0});
+        // MOVI: result = {rd[63:12], L[11:0]} = {0[63:12], 5} = 5
+        check("mov_L_to_reg", 1, {52'd0, 12'd5});
 
         $display("\n=== Results: %0d PASS, %0d FAIL ===", pass_count, fail_count);
         $finish;
