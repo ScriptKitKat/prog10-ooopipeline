@@ -51,6 +51,7 @@ module tinker_core(
     wire [63:0] rob_mispredict_target;
     wire [4:0]  rob_mispredict_rob_idx;
     wire [1:0]  rob_mispredict_snap_id;
+    wire        rob_has_unresolved_branch;
     wire        rob_commit_en1, rob_commit_en2;
     wire [2:0]  rob_commit_type1, rob_commit_type2;
     wire [4:0]  rob_commit_arch_rd1, rob_commit_arch_rd2;
@@ -161,6 +162,7 @@ module tinker_core(
     // Flush signal (from ROB misprediction)
     // ================================================================
     wire flush = rob_flush_all;
+    wire pipe_kill = rob_flush_all || rob_halt_committed || hlt;
 
     // ================================================================
     // Branch resolution: combine from ALU pipes + LQ with overflow queue
@@ -200,7 +202,7 @@ module tinker_core(
                                    alu1_br_resolved && lq_br_resolved   ? lq_br_rob_idx : 5'd0;
 
     always @(posedge clk or posedge reset) begin
-        if (reset || flush) begin
+        if (reset || pipe_kill) begin
             br_deferred_valid <= 1'b0;
         end else if (br_second_valid) begin
             // A second branch resolved this cycle; defer it to next cycle
@@ -384,9 +386,11 @@ module tinker_core(
     wire slot2_singleq_conflict =
         ((is_load1 || is_return1) && (is_load2 || is_return2)) ||
         ((is_store1_only || is_call1) && (is_store2_only || is_call2));
-    wire slot2_blocked = target_full2 || slot2_singleq_conflict;
+    wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 && (is_branch1 || is_return1);
+    wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
 
-    assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 ||
+    assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 || rob_has_unresolved_branch ||
+                        hlt || rob_halt_committed ||
                         (fu_out_valid1 && target_full1);
 
     // Valid dispatch signals
@@ -470,18 +474,20 @@ module tinker_core(
                             (cdb1_valid && cdb1_tag == prf_rd2 && !prf_read_ready2) ? cdb1_value :
                             prf_read_data2;
 
-    wire src1_rdy2 = src1_dc2 || prf_read_ready3 ||
+    // A same-cycle dependency on slot 1's freshly allocated destination must wait for the
+    // later CDB broadcast. The recycled physreg may still hold stale data/ready state in the PRF.
+    wire src1_rdy2 = src1_dc2 || (!intra_dep_src1_2 && prf_read_ready3) ||
                      (cdb0_valid && cdb0_tag == prf_rd3) ||
                      (cdb1_valid && cdb1_tag == prf_rd3);
-    wire [63:0] src1_val2 = (cdb0_valid && cdb0_tag == prf_rd3 && !prf_read_ready3) ? cdb0_value :
-                            (cdb1_valid && cdb1_tag == prf_rd3 && !prf_read_ready3) ? cdb1_value :
+    wire [63:0] src1_val2 = (cdb0_valid && cdb0_tag == prf_rd3 && (!prf_read_ready3 || intra_dep_src1_2)) ? cdb0_value :
+                            (cdb1_valid && cdb1_tag == prf_rd3 && (!prf_read_ready3 || intra_dep_src1_2)) ? cdb1_value :
                             prf_read_data3;
 
-    wire src2_rdy2 = src2_dc2 || prf_read_ready4 ||
+    wire src2_rdy2 = src2_dc2 || (!intra_dep_src2_2 && prf_read_ready4) ||
                      (cdb0_valid && cdb0_tag == prf_rd4) ||
                      (cdb1_valid && cdb1_tag == prf_rd4);
-    wire [63:0] src2_val2 = (cdb0_valid && cdb0_tag == prf_rd4 && !prf_read_ready4) ? cdb0_value :
-                            (cdb1_valid && cdb1_tag == prf_rd4 && !prf_read_ready4) ? cdb1_value :
+    wire [63:0] src2_val2 = (cdb0_valid && cdb0_tag == prf_rd4 && (!prf_read_ready4 || intra_dep_src2_2)) ? cdb0_value :
+                            (cdb1_valid && cdb1_tag == prf_rd4 && (!prf_read_ready4 || intra_dep_src2_2)) ? cdb1_value :
                             prf_read_data4;
 
     // IMM field for dispatch
@@ -689,7 +695,7 @@ module tinker_core(
         .out_pc2(fu_out_pc2),
         .decode_stall(decode_stall),
         .consume_two(dispatch_valid2),
-        .flush(flush),
+        .flush(pipe_kill),
         .redirect_pc(rob_mispredict_target)
     );
 
@@ -890,7 +896,7 @@ module tinker_core(
         .issue_pc(rs_alu0_issue_pc),
         .issue_ack(rs_alu0_issue_valid && alu0_issue_ready),
         .full(rs_alu0_full),
-        .flush(flush)
+        .flush(pipe_kill)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_alu1(
@@ -919,7 +925,7 @@ module tinker_core(
         .issue_pc(rs_alu1_issue_pc),
         .issue_ack(rs_alu1_issue_valid && alu1_issue_ready),
         .full(rs_alu1_full),
-        .flush(flush)
+        .flush(pipe_kill)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_fpu0(
@@ -948,7 +954,7 @@ module tinker_core(
         .issue_pc(rs_fpu0_issue_pc),
         .issue_ack(rs_fpu0_issue_valid && fpu0_issue_ready),
         .full(rs_fpu0_full),
-        .flush(flush)
+        .flush(pipe_kill)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_fpu1(
@@ -977,7 +983,7 @@ module tinker_core(
         .issue_pc(rs_fpu1_issue_pc),
         .issue_ack(rs_fpu1_issue_valid && fpu1_issue_ready),
         .full(rs_fpu1_full),
-        .flush(flush)
+        .flush(pipe_kill)
     );
 
     // --- ALU Pipes ---
@@ -1001,7 +1007,7 @@ module tinker_core(
         .br_target(alu0_br_target),
         .br_rob_idx_out(alu0_br_rob_idx),
         .cdb_stall(cdb_alu0_stall),
-        .flush(flush)
+        .flush(pipe_kill)
     );
 
     alu_pipe alu_pipe1(
@@ -1024,7 +1030,7 @@ module tinker_core(
         .br_target(alu1_br_target),
         .br_rob_idx_out(alu1_br_rob_idx),
         .cdb_stall(cdb_alu1_stall),
-        .flush(flush)
+        .flush(pipe_kill)
     );
 
     // --- FPU (wrapper containing both FPU pipes) ---
@@ -1054,7 +1060,7 @@ module tinker_core(
         .pipe1_cdb_rob_idx(fpu1_cdb_rob),
         .pipe0_cdb_stall(cdb_fpu0_stall),
         .pipe1_cdb_stall(cdb_fpu1_stall),
-        .flush(flush)
+        .flush(pipe_kill)
     );
 
     // --- Load Queue ---
@@ -1168,6 +1174,7 @@ module tinker_core(
         .mispredict_rob_idx(rob_mispredict_rob_idx),
         .mispredict_snap_id(rob_mispredict_snap_id),
         .flush_all(rob_flush_all),
+        .has_unresolved_branch(rob_has_unresolved_branch),
         .commit_en1(rob_commit_en1),
         .commit_type1(rob_commit_type1),
         .commit_arch_rd1(rob_commit_arch_rd1),
@@ -1347,12 +1354,18 @@ module reg_file(
         registers[31] = `MEM_SIZE;
     end
 
+    // Reset clears architectural state once when reset is asserted.
+    // Backdoor writes performed later while reset remains high still persist,
+    // and the negedge-reset PRF sync copies that final state into P0-P31.
+    always @(posedge reset) begin
+        for (i = 0; i < 31; i = i + 1) begin
+            registers[i] <= 64'b0;
+        end
+        registers[31] <= `MEM_SIZE;
+    end
+
     always @(posedge clk) begin
-        if (reset) begin
-            // Only ensure r31 = MEM_SIZE during reset
-            // Don't clear other registers so testbench backdoor writes persist
-            registers[31] <= `MEM_SIZE;
-        end else begin
+        if (!reset) begin
             // Write port 2 first, then port 1 takes priority on conflict
             if (write_en2) begin
                 registers[write_sel2] <= write_data2;
@@ -3526,6 +3539,7 @@ module rob(
 
     // Status
     output wire        can_alloc2,
+    output wire        has_unresolved_branch,
     output reg         halt_committed
 );
 
@@ -3560,10 +3574,21 @@ module rob(
 
     reg [4:0] head, tail;
     reg [5:0] count;
+    integer ub_i;
+    reg unresolved_branch_pending;
 
     assign alloc_idx1 = tail;
     assign alloc_idx2 = tail + 5'd1;
     assign can_alloc2 = (count <= 6'd30);
+    assign has_unresolved_branch = unresolved_branch_pending;
+    always @(*) begin
+        unresolved_branch_pending = 1'b0;
+        for (ub_i = 0; ub_i < DEPTH; ub_i = ub_i + 1) begin
+            if (valid[ub_i] && itype[ub_i] == ITYPE_BRANCH && !branch_resolved_flag[ub_i]) begin
+                unresolved_branch_pending = 1'b1;
+            end
+        end
+    end
 
     // Helper: check if index is strictly between head and tail (exclusive)
     // i.e., index is a valid allocated entry after br_rob_idx
@@ -3605,6 +3630,9 @@ module rob(
             commit_en1 <= 0;
             commit_en2 <= 0;
 
+            if (halt_committed) begin
+                // HALT is terminal: stop allocating/committing further work.
+            end else begin
             // Track whether a mispredict fires this cycle (blocking var for alloc guard)
             // Unified count tracking to avoid non-blocking assignment conflicts
             begin : mispredict_guard
@@ -3787,6 +3815,7 @@ module rob(
                 count <= count - commit_count + alloc_count;
             end
             end // mispredict_guard
+            end
         end
     end
 
