@@ -721,6 +721,9 @@ module tinker_core(
         .snap_id1(snap_id1),
         .snap_en2(take_snap2),
         .snap_id2(snap_id2),
+        .snap1_wr_override(alloc_preg1 && dispatch_valid1 && rat_same_dest),
+        .snap1_wr_areg(dest_areg1),
+        .snap1_wr_preg(new_phys_rd1),
         .restore_en(flush),
         .restore_id(rob_mispredict_snap_id)
     );
@@ -748,6 +751,9 @@ module tinker_core(
         .snap_id1(snap_id1),
         .snap_en2(take_snap2),
         .snap_id2(snap_id2),
+        .snap1_wr_override(alloc_preg1 && dispatch_valid1 && rat_same_dest),
+        .snap1_wr_areg(dest_areg1),
+        .snap1_wr_preg(new_phys_rd1),
         .restore_en(flush),
         .restore_id(rob_mispredict_snap_id)
     );
@@ -773,9 +779,11 @@ module tinker_core(
         .deq_en2(alloc_preg2 && dispatch_valid2),
         .deq_preg1(fl_deq_preg1),
         .deq_preg2(fl_deq_preg2),
-        .enq_en1(rob_commit_en1 && rob_commit_type1 != ITYPE_STORE && rob_commit_type1 != ITYPE_HALT),
+        // Only enqueue old_phys back to free list when instruction actually wrote a register
+        // (new_phys != 0 means a physical register was allocated at rename)
+        .enq_en1(rob_commit_en1 && rob_commit_new_phys1 != 7'd0),
         .enq_preg1(rob_commit_old_phys1),
-        .enq_en2(rob_commit_en2 && rob_commit_type2 != ITYPE_STORE && rob_commit_type2 != ITYPE_HALT),
+        .enq_en2(rob_commit_en2 && rob_commit_new_phys2 != 7'd0),
         .enq_preg2(rob_commit_old_phys2),
         .can_alloc2(fl_can_alloc2),
         .snap_en1(take_snap1),
@@ -820,8 +828,9 @@ module tinker_core(
     // When both write the same arch reg, the NEWER value must win.
     // So we put the newer commit on port 1 (high prio) and older on port 2,
     // OR suppress the older write when both target the same register.
-    wire arf_wen1_raw = rob_commit_en1 && rob_commit_type1 != ITYPE_STORE && rob_commit_type1 != ITYPE_HALT;
-    wire arf_wen2_raw = rob_commit_en2 && rob_commit_type2 != ITYPE_STORE && rob_commit_type2 != ITYPE_HALT;
+    // Only write ARF when instruction actually wrote a register (new_phys != 0)
+    wire arf_wen1_raw = rob_commit_en1 && rob_commit_new_phys1 != 7'd0;
+    wire arf_wen2_raw = rob_commit_en2 && rob_commit_new_phys2 != 7'd0;
     wire arf_same_dest = arf_wen1_raw && arf_wen2_raw &&
                          (rob_commit_arch_rd1 == rob_commit_arch_rd2);
     // Suppress older write (port 1) when both write same register
@@ -1518,6 +1527,10 @@ module rat(
     input [1:0] snap_id1,
     input snap_en2,
     input [1:0] snap_id2,
+    // Override for snapshot 1: un-suppressed slot 1 write (for rat_same_dest case)
+    input snap1_wr_override,
+    input [4:0] snap1_wr_areg,
+    input [6:0] snap1_wr_preg,
     // Restore
     input restore_en,
     input [1:0] restore_id
@@ -1566,9 +1579,11 @@ module rat(
                 for (i = 0; i < 32; i = i + 1) begin
                     snap_store[snap_base + i] <= rat_table[i];
                 end
-                // Include slot 1's write only
+                // Include slot 1's write — use override when write_en1 is suppressed (rat_same_dest)
                 if (write_en1) begin
                     snap_store[snap_base + write_areg1] <= write_preg1;
+                end else if (snap1_wr_override) begin
+                    snap_store[snap_base + snap1_wr_areg] <= snap1_wr_preg;
                 end
             end
             // Take snapshot 2 (for branch in slot 2): captures state after both slots' renames
@@ -3240,13 +3255,14 @@ module store_queue(
     end
 
     // Store-to-load forwarding (combinational)
+    // Gate with !flush to prevent forwarding speculative data during a flush cycle
     integer fwd_i;
     always @(*) begin
         fwd_hit = 0;
         fwd_data = 64'd0;
-        if (fwd_check_en) begin
+        if (fwd_check_en && !flush) begin
             for (fwd_i = 0; fwd_i < NUM_ENTRIES; fwd_i = fwd_i + 1) begin
-                if (sq_valid[fwd_i] && sq_addr_computed[fwd_i] &&
+                if (sq_valid[fwd_i] && sq_committed[fwd_i] && sq_addr_computed[fwd_i] &&
                     sq_data_ready[fwd_i] && sq_addr[fwd_i] == fwd_check_addr) begin
                     fwd_hit = 1;
                     fwd_data = sq_data_val[fwd_i];
