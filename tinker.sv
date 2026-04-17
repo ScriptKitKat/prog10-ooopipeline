@@ -557,8 +557,8 @@ module tinker_core(
     wire [6:0]  lq_disp_base_tag = lq_disp_from1 ? prf_rd1 : prf_rd3;
     wire        lq_disp_base_rdy = lq_disp_from1 ? src1_rdy1 : src1_rdy2;
     wire [63:0] lq_disp_imm      = lq_disp_from1 ?
-                                    (is_return1 ? 64'sd0 : dispatch_imm1) :
-                                    (is_return2 ? 64'sd0 : dispatch_imm2);
+                                    (is_return1 ? 64'sd8 : dispatch_imm1) :
+                                    (is_return2 ? 64'sd8 : dispatch_imm2);
     wire [6:0]  lq_disp_dest_tag = lq_disp_from1 ? new_phys_rd1 : new_phys_rd2;
     wire [4:0]  lq_disp_rob_idx  = lq_disp_from1 ? rob_alloc_idx1 : rob_alloc_idx2;
     wire [4:0]  lq_disp_opcode   = lq_disp_from1 ? opcode1 : opcode2;
@@ -589,8 +589,8 @@ module tinker_core(
                                    (is_call1 ? 1'b1 : src2_rdy1) :
                                    (is_call2 ? 1'b1 : src2_rdy2);
     wire [63:0] sq_disp_imm = sq_disp_from1 ?
-                               (is_call1 ? -64'sd8 : dispatch_imm1) :
-                               (is_call2 ? -64'sd8 : dispatch_imm2);
+                               (is_call1 ? 64'sd0 : dispatch_imm1) :
+                               (is_call2 ? 64'sd0 : dispatch_imm2);
     wire [4:0]  sq_disp_rob_idx = sq_disp_from1 ? rob_alloc_idx1 : rob_alloc_idx2;
     wire [4:0]  sq_disp_opcode  = sq_disp_from1 ? opcode1 : opcode2;
 
@@ -2570,7 +2570,7 @@ module load_queue(
                 // RETURN: CDB value = address (r31-8) for r31 update; branch target = loaded data
                 // Regular load: CDB value = loaded data
                 if (lq_opcode[cdb_slot] == 5'h0d) begin
-                    cdb_value <= lq_addr[cdb_slot] + 64'd8; // r31 + 8 (pop stack)
+                    cdb_value <= lq_addr[cdb_slot]; // r31 - 8 for RETURN
                     br_resolved <= 1;
                     br_taken <= 1;
                     br_target <= lq_mem_data[cdb_slot]; // loaded return address
