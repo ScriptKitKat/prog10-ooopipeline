@@ -387,12 +387,22 @@ module tinker_core(
     wire [6:0] ren_phys_src2_2_final;
 
     // Decode stall conditions
-    wire target_full1 = (is_alu1 && ((!alu_rr && rs_alu0_full) || (alu_rr && rs_alu1_full))) ||
-                        (is_fpu1 && ((!fpu_rr && rs_fpu0_full) || (fpu_rr && rs_fpu1_full))) ||
+    wire target_full1 = (is_alu1 && rs_alu0_full && rs_alu1_full) ||
+                        (is_fpu1 && rs_fpu0_full && rs_fpu1_full) ||
                         ((is_load1 || is_return1) && lq_full) ||
                         ((is_store1 || is_call1) && sq_full);
-    wire target_full2 = (is_alu2 && ((!alu_rr_after1 && rs_alu0_full) || (alu_rr_after1 && rs_alu1_full))) ||
-                        (is_fpu2 && ((!fpu_rr_after1 && rs_fpu0_full) || (fpu_rr_after1 && rs_fpu1_full))) ||
+
+    wire slot1_alu_to0 = is_alu1 && (!alu_rr ? !rs_alu0_full : (rs_alu1_full && !rs_alu0_full));
+    wire slot1_alu_to1 = is_alu1 && ( alu_rr ? !rs_alu1_full : (rs_alu0_full && !rs_alu1_full));
+    wire slot1_fpu_to0 = is_fpu1 && (!fpu_rr ? !rs_fpu0_full : (rs_fpu1_full && !rs_fpu0_full));
+    wire slot1_fpu_to1 = is_fpu1 && ( fpu_rr ? !rs_fpu1_full : (rs_fpu0_full && !rs_fpu1_full));
+    wire alu0_avail2 = !rs_alu0_full && !(fu_out_valid1 && !target_full1 && slot1_alu_to0);
+    wire alu1_avail2 = !rs_alu1_full && !(fu_out_valid1 && !target_full1 && slot1_alu_to1);
+    wire fpu0_avail2 = !rs_fpu0_full && !(fu_out_valid1 && !target_full1 && slot1_fpu_to0);
+    wire fpu1_avail2 = !rs_fpu1_full && !(fu_out_valid1 && !target_full1 && slot1_fpu_to1);
+
+    wire target_full2 = (is_alu2 && !alu0_avail2 && !alu1_avail2) ||
+                        (is_fpu2 && !fpu0_avail2 && !fpu1_avail2) ||
                         ((is_load2 || is_return2) && lq_full) ||
                         ((is_store2 || is_call2) && sq_full);
 
@@ -420,18 +430,22 @@ module tinker_core(
     // RS dispatch signals (directly wired based on opcode and RR)
     // ================================================================
     // Instruction 1 dispatch enables
-    wire disp1_to_alu0 = dispatch_valid1 && (is_alu1) && !alu_rr;
-    wire disp1_to_alu1 = dispatch_valid1 && (is_alu1) && alu_rr;
-    wire disp1_to_fpu0 = dispatch_valid1 && is_fpu1 && !fpu_rr;
-    wire disp1_to_fpu1 = dispatch_valid1 && is_fpu1 && fpu_rr;
+    wire disp1_to_alu0 = dispatch_valid1 && slot1_alu_to0;
+    wire disp1_to_alu1 = dispatch_valid1 && slot1_alu_to1;
+    wire disp1_to_fpu0 = dispatch_valid1 && slot1_fpu_to0;
+    wire disp1_to_fpu1 = dispatch_valid1 && slot1_fpu_to1;
     wire disp1_to_lq   = dispatch_valid1 && (is_load1 || is_return1);
     wire disp1_to_sq   = dispatch_valid1 && (is_store1_only || is_call1);
 
     // Instruction 2 dispatch enables
-    wire disp2_to_alu0 = dispatch_valid2 && (is_alu2) && !alu_rr_after1;
-    wire disp2_to_alu1 = dispatch_valid2 && (is_alu2) && alu_rr_after1;
-    wire disp2_to_fpu0 = dispatch_valid2 && is_fpu2 && !fpu_rr_after1;
-    wire disp2_to_fpu1 = dispatch_valid2 && is_fpu2 && fpu_rr_after1;
+    wire slot2_alu_to0 = is_alu2 && (!alu_rr_after1 ? alu0_avail2 : (!alu1_avail2 && alu0_avail2));
+    wire slot2_alu_to1 = is_alu2 && ( alu_rr_after1 ? alu1_avail2 : (!alu0_avail2 && alu1_avail2));
+    wire slot2_fpu_to0 = is_fpu2 && (!fpu_rr_after1 ? fpu0_avail2 : (!fpu1_avail2 && fpu0_avail2));
+    wire slot2_fpu_to1 = is_fpu2 && ( fpu_rr_after1 ? fpu1_avail2 : (!fpu0_avail2 && fpu1_avail2));
+    wire disp2_to_alu0 = dispatch_valid2 && slot2_alu_to0;
+    wire disp2_to_alu1 = dispatch_valid2 && slot2_alu_to1;
+    wire disp2_to_fpu0 = dispatch_valid2 && slot2_fpu_to0;
+    wire disp2_to_fpu1 = dispatch_valid2 && slot2_fpu_to1;
     wire disp2_to_lq   = dispatch_valid2 && (is_load2 || is_return2);
     wire disp2_to_sq   = dispatch_valid2 && (is_store2_only || is_call2);
 
@@ -3178,21 +3192,52 @@ module rob(
                 reg [4:0] head2;
                 reg is_store1, is_store2;
                 reg is_call1, is_call2;
+                reg head_complete_now, head2_complete_now;
+                reg [63:0] head_result_now, head2_result_now;
+                reg head_store_addr_now, head_store_data_now;
+                reg head2_store_addr_now, head2_store_data_now;
+                reg [63:0] head_store_data_now_val, head2_store_data_now_val;
 
                 head2 = head + 5'd1;
                 is_store1 = (itype[head] == ITYPE_STORE);
                 is_store2 = (itype[head2] == ITYPE_STORE);
+                head_complete_now = complete[head] ||
+                                    (cdb0_valid && cdb0_rob_idx == head) ||
+                                    (cdb1_valid && cdb1_rob_idx == head) ||
+                                    (br_resolved && br_rob_idx == head);
+                head2_complete_now = complete[head2] ||
+                                     (cdb0_valid && cdb0_rob_idx == head2) ||
+                                     (cdb1_valid && cdb1_rob_idx == head2) ||
+                                     (br_resolved && br_rob_idx == head2);
+                head_result_now = (cdb0_valid && cdb0_rob_idx == head) ? cdb0_value :
+                                  (cdb1_valid && cdb1_rob_idx == head) ? cdb1_value :
+                                  result[head];
+                head2_result_now = (cdb0_valid && cdb0_rob_idx == head2) ? cdb0_value :
+                                   (cdb1_valid && cdb1_rob_idx == head2) ? cdb1_value :
+                                   result[head2];
+                head_store_addr_now = store_addr_rdy[head] ||
+                                      (sq_addr_ready && sq_addr_rob_idx == head);
+                head_store_data_now = store_data_rdy[head] ||
+                                      (sq_data_ready && sq_data_rob_idx == head);
+                head2_store_addr_now = store_addr_rdy[head2] ||
+                                       (sq_addr_ready && sq_addr_rob_idx == head2);
+                head2_store_data_now = store_data_rdy[head2] ||
+                                       (sq_data_ready && sq_data_rob_idx == head2);
+                head_store_data_now_val = (sq_data_ready && sq_data_rob_idx == head) ?
+                                          sq_data_val : store_data[head];
+                head2_store_data_now_val = (sq_data_ready && sq_data_rob_idx == head2) ?
+                                           sq_data_val : store_data[head2];
                 // CALL is encoded as a branch ROB entry with an accompanying SQ entry.
                 // Wait for that SQ entry to have both address and data ready before retiring it.
                 is_call1 = (itype[head] == ITYPE_BRANCH) &&
-                           (store_addr_rdy[head] || store_data_rdy[head]);
+                           (head_store_addr_now || head_store_data_now);
                 is_call2 = (itype[head2] == ITYPE_BRANCH) &&
-                           (store_addr_rdy[head2] || store_data_rdy[head2]);
+                           (head2_store_addr_now || head2_store_data_now);
 
                 can_commit1 = valid[head] && (
-                    (complete[head] && (!is_call1 ||
-                     (store_addr_rdy[head] && store_data_rdy[head]))) ||
-                    (is_store1 && store_addr_rdy[head] && store_data_rdy[head]) ||
+                    (head_complete_now && (!is_call1 ||
+                     (head_store_addr_now && head_store_data_now))) ||
+                    (is_store1 && head_store_addr_now && head_store_data_now) ||
                     (itype[head] == ITYPE_HALT)
                 );
 
@@ -3203,7 +3248,7 @@ module rob(
                     commit_old_phys1 <= old_phys[head];
                     commit_new_phys1 <= new_phys[head];
                     commit_rob_idx1 <= head;
-                    commit_value1 <= is_store1 ? store_data[head] : result[head];
+                    commit_value1 <= is_store1 ? head_store_data_now_val : head_result_now;
                     valid[head] <= 0;
                     complete[head] <= 0;
                     store_addr_rdy[head] <= 0;
@@ -3216,9 +3261,9 @@ module rob(
 
                     // Try second commit
                     can_commit2 = valid[head2] && (count > 6'd1) && (
-                        (complete[head2] && (!is_call2 ||
-                         (store_addr_rdy[head2] && store_data_rdy[head2]))) ||
-                        (is_store2 && store_addr_rdy[head2] && store_data_rdy[head2]) ||
+                        (head2_complete_now && (!is_call2 ||
+                         (head2_store_addr_now && head2_store_data_now))) ||
+                        (is_store2 && head2_store_addr_now && head2_store_data_now) ||
                         (itype[head2] == ITYPE_HALT)
                     );
 
@@ -3234,7 +3279,7 @@ module rob(
                         commit_old_phys2 <= old_phys[head2];
                         commit_new_phys2 <= new_phys[head2];
                         commit_rob_idx2 <= head2;
-                        commit_value2 <= is_store2 ? store_data[head2] : result[head2];
+                        commit_value2 <= is_store2 ? head2_store_data_now_val : head2_result_now;
                         valid[head2] <= 0;
                         complete[head2] <= 0;
                         store_addr_rdy[head2] <= 0;
