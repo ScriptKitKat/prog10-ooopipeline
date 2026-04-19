@@ -218,7 +218,7 @@ module tinker_core(
                                    alu1_br_resolved && lq_br_resolved   ? lq_br_rob_idx : 5'd0;
 
     always @(posedge clk or posedge reset) begin
-        if (reset || pipe_kill) begin
+        if (reset || pipe_kill || flush) begin
             br_deferred_valid <= 1'b0;
         end else if (br_second_valid) begin
             // A second branch resolved this cycle; defer it to next cycle
@@ -509,10 +509,9 @@ module tinker_core(
                             prf_read_data4;
 
     // IMM field for dispatch
-    // BRGT uses rd as the branch target register in the ISA tests.
-    // We overload the RS imm field with that already-committed architectural value.
-    wire [63:0] dispatch_imm1 = (opcode1 == 5'h0e) ? reg_file.registers[rd1] : imm1;
-    wire [63:0] dispatch_imm2 = (opcode2 == 5'h0e) ? reg_file.registers[rd2] : imm2;
+    // IMM field: sign-extended L for all instructions
+    wire [63:0] dispatch_imm1 = imm1;
+    wire [63:0] dispatch_imm2 = imm2;
 
 
     // ================================================================
@@ -715,7 +714,7 @@ module tinker_core(
         .out_pc2(fu_out_pc2),
         .decode_stall(decode_stall),
         .consume_two(dispatch_valid2),
-        .flush(pipe_kill),
+        .flush(flush || pipe_kill),
         .redirect_pc(rob_mispredict_target)
     );
 
@@ -760,7 +759,7 @@ module tinker_core(
         .snap1_wr_override(alloc_preg1 && dispatch_valid1 && rat_same_dest),
         .snap1_wr_areg(dest_areg1),
         .snap1_wr_preg(new_phys_rd1),
-        .restore_en(1'b0),
+        .restore_en(flush),
         .restore_id(rob_mispredict_snap_id)
     );
 
@@ -790,7 +789,7 @@ module tinker_core(
         .snap1_wr_override(alloc_preg1 && dispatch_valid1 && rat_same_dest),
         .snap1_wr_areg(dest_areg1),
         .snap1_wr_preg(new_phys_rd1),
-        .restore_en(1'b0),
+        .restore_en(flush),
         .restore_id(rob_mispredict_snap_id)
     );
 
@@ -826,7 +825,7 @@ module tinker_core(
         .snap_id1(snap_id1),
         .snap_en2(take_snap2),
         .snap_id2(snap_id2),
-        .restore_en(1'b0),
+        .restore_en(flush),
         .restore_id(rob_mispredict_snap_id)
     );
 
@@ -2064,10 +2063,11 @@ module alu_pipe(
                 s1_brtgt_next = 64'd0;
                 s1_taken_next = 1'b1;
             end
-            5'h0e: begin // BRGT rd, rs, rt -> target = rd register, taken = (rs > rt)
+            5'h0e: begin // BRGT rd, rs, rt -> target = PC + L, taken = (rs > rt)
                 s1_cat_next = CAT_BRANCH; s1_sub_next = SUB_BRGT;
                 s1_isbr_next = 1'b1; s1_hasres_next = 1'b0;
-                s1_brtgt_next = issue_imm;
+                // Prepare operands for target addition in stage 2 (imm + pc)
+                s1_opa_next = issue_imm; s1_opb_next = issue_pc;
                 // Condition: rs > rt (src1 > src2)
                 s1_taken_next = (issue_src1 > issue_src2);
             end
@@ -2143,7 +2143,7 @@ module alu_pipe(
                     SUB_BRRL: s2_brtgt_comb = s1_operand_a + s1_operand_b; // imm + pc
                     SUB_CALL: s2_result_comb = s1_operand_a - s1_operand_b; // unused by CALL
                     SUB_RET:  s2_result_comb = s1_operand_a - s1_operand_b; // src1 - 8
-                    SUB_BRGT: s2_brtgt_comb = s1_br_target;
+                    SUB_BRGT: s2_brtgt_comb = s1_operand_a + s1_operand_b; // imm + pc
                     default: ; // BR, BRNZ: target already in s1_br_target
                 endcase
             end
