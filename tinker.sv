@@ -2498,16 +2498,16 @@ module load_queue(
     input [63:0] sq_fwd_data,
 
     // CDB output
-    output reg cdb_valid,
-    output reg [6:0] cdb_tag,
-    output reg [63:0] cdb_value,
-    output reg [4:0] cdb_rob_idx,
+    output wire cdb_valid,
+    output wire [6:0] cdb_tag,
+    output wire [63:0] cdb_value,
+    output wire [4:0] cdb_rob_idx,
 
     // Branch resolution (for RETURN instructions)
-    output reg br_resolved,
-    output reg br_taken,
-    output reg [63:0] br_target,
-    output reg [4:0] br_rob_idx_out,
+    output wire br_resolved,
+    output wire br_taken,
+    output wire [63:0] br_target,
+    output wire [4:0] br_rob_idx_out,
 
     // CDB backpressure
     input cdb_stall,
@@ -2517,7 +2517,7 @@ module load_queue(
     input flush
 );
 
-    parameter NUM_ENTRIES = 8;
+    parameter NUM_ENTRIES = 16;
 
     reg lq_valid [0:NUM_ENTRIES-1];
     reg [63:0] lq_base_val [0:NUM_ENTRIES-1];
@@ -2537,7 +2537,7 @@ module load_queue(
 
     // Full detection
     integer vc;
-    reg [3:0] valid_count;
+    reg [4:0] valid_count;
     always @(*) begin
         valid_count = 0;
         for (vc = 0; vc < NUM_ENTRIES; vc = vc + 1)
@@ -2547,14 +2547,14 @@ module load_queue(
 
     // Find free slot
     integer fi;
-    reg [2:0] free_slot;
+    reg [3:0] free_slot;
     reg free_found;
     always @(*) begin
         free_found = 0;
         free_slot = 0;
         for (fi = 0; fi < NUM_ENTRIES; fi = fi + 1) begin
             if (!lq_valid[fi] && !free_found) begin
-                free_slot = fi[2:0];
+                free_slot = fi[3:0];
                 free_found = 1;
             end
         end
@@ -2562,7 +2562,7 @@ module load_queue(
 
     // Find oldest entry ready to issue memory read (addr_computed && !done)
     integer si;
-    reg [2:0] read_slot;
+    reg [3:0] read_slot;
     reg read_found;
     reg [4:0] read_min_age;
     always @(*) begin
@@ -2572,7 +2572,7 @@ module load_queue(
         for (si = 0; si < NUM_ENTRIES; si = si + 1) begin
             if (lq_valid[si] && lq_addr_computed[si] && !lq_done[si]) begin
                 if (!read_found || lq_age[si] < read_min_age) begin
-                    read_slot = si[2:0];
+                    read_slot = si[3:0];
                     read_min_age = lq_age[si];
                     read_found = 1;
                 end
@@ -2588,7 +2588,7 @@ module load_queue(
 
     // Find oldest done entry to output on CDB
     integer ci;
-    reg [2:0] cdb_slot;
+    reg [3:0] cdb_slot;
     reg cdb_found;
     reg [4:0] cdb_min_age;
     always @(*) begin
@@ -2598,13 +2598,31 @@ module load_queue(
         for (ci = 0; ci < NUM_ENTRIES; ci = ci + 1) begin
             if (lq_valid[ci] && lq_done[ci]) begin
                 if (!cdb_found || lq_age[ci] < cdb_min_age) begin
-                    cdb_slot = ci[2:0];
+                    cdb_slot = ci[3:0];
                     cdb_min_age = lq_age[ci];
                     cdb_found = 1;
                 end
             end
         end
     end
+
+    wire read_is_return = read_found && (lq_opcode[read_slot] == 5'h0d);
+    wire cdb_is_return  = cdb_found  && (lq_opcode[cdb_slot]  == 5'h0d);
+    wire use_done_slot  = cdb_found;
+    wire use_read_slot  = !cdb_found && read_found;
+    wire [63:0] read_data_now = sq_fwd_valid ? sq_fwd_data : mem_read_data;
+
+    assign cdb_valid = !flush && ((use_done_slot && !cdb_is_return) ||
+                                  (use_read_slot && !read_is_return));
+    assign cdb_tag = use_done_slot ? lq_dest_tag[cdb_slot] : lq_dest_tag[read_slot];
+    assign cdb_value = use_done_slot ? lq_mem_data[cdb_slot] : read_data_now;
+    assign cdb_rob_idx = use_done_slot ? lq_rob_idx[cdb_slot] : lq_rob_idx[read_slot];
+
+    assign br_resolved = !flush && !cdb_stall && ((use_done_slot && cdb_is_return) ||
+                                                  (use_read_slot && read_is_return));
+    assign br_taken = br_resolved;
+    assign br_target = use_done_slot ? lq_mem_data[cdb_slot] : read_data_now;
+    assign br_rob_idx_out = use_done_slot ? lq_rob_idx[cdb_slot] : lq_rob_idx[read_slot];
 
     integer i;
     always @(posedge clk or posedge rst) begin
@@ -2616,12 +2634,7 @@ module load_queue(
                 lq_done[i] <= 0;
             end
             age_counter <= 0;
-            cdb_valid <= 0;
-            br_resolved <= 0;
         end else begin
-            cdb_valid <= 0;
-            br_resolved <= 0;
-
             // CDB snoop: update base values
             for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
                 if (lq_valid[i] && !lq_base_ready[i]) begin
@@ -2636,43 +2649,28 @@ module load_queue(
                 end
             end
 
-            // Address computation
+            // Address computation, including same-cycle CDB wakeup for the base register.
             for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
-                if (lq_valid[i] && lq_base_ready[i] && !lq_addr_computed[i]) begin
-                    lq_addr[i] <= lq_base_val[i] + lq_imm[i];
+                reg base_ready_now;
+                reg [63:0] base_val_now;
+                base_ready_now = lq_base_ready[i] ||
+                                 (cdb0_valid && lq_base_tag[i] == cdb0_tag) ||
+                                 (cdb1_valid && lq_base_tag[i] == cdb1_tag);
+                base_val_now = (cdb0_valid && lq_base_tag[i] == cdb0_tag && !lq_base_ready[i]) ? cdb0_value :
+                               (cdb1_valid && lq_base_tag[i] == cdb1_tag && !lq_base_ready[i]) ? cdb1_value :
+                               lq_base_val[i];
+                if (lq_valid[i] && base_ready_now && !lq_addr_computed[i]) begin
+                    lq_addr[i] <= base_val_now + lq_imm[i];
                     lq_addr_computed[i] <= 1;
                 end
             end
 
-            // Memory read completion: mark done, store loaded data separately
-            if (read_found) begin
-                if (sq_fwd_valid) begin
-                    lq_mem_data[read_slot] <= sq_fwd_data;
-                    lq_done[read_slot] <= 1;
-                end else begin
-                    lq_mem_data[read_slot] <= mem_read_data;
-                    lq_done[read_slot] <= 1;
-                end
-            end
-
-            // CDB output and free entry (respect backpressure)
+            // CDB output and free entry (respect backpressure). A selected memory read can
+            // complete directly to the CDB, avoiding a separate done->broadcast cycle.
             if (cdb_found && !cdb_stall) begin
-                if (lq_opcode[cdb_slot] == 5'h0d) begin
-                    // RETURN only resolves the branch. It restores the PC from mem[r31-8]
-                    // and does not write back a register result.
-                    cdb_valid <= 0;
-                    br_resolved <= 1;
-                    br_taken <= 1;
-                    br_target <= lq_mem_data[cdb_slot]; // loaded return address
-                    br_rob_idx_out <= lq_rob_idx[cdb_slot];
-                end else begin
-                    // Regular load: broadcast loaded data on CDB
-                    cdb_valid <= 1;
-                    cdb_tag <= lq_dest_tag[cdb_slot];
-                    cdb_value <= lq_mem_data[cdb_slot];
-                end
-                cdb_rob_idx <= lq_rob_idx[cdb_slot];
                 lq_valid[cdb_slot] <= 0;
+            end else if (read_found && !cdb_stall) begin
+                lq_valid[read_slot] <= 0;
             end
 
             // Dispatch
@@ -2685,7 +2683,8 @@ module load_queue(
                 lq_dest_tag[free_slot] <= dispatch_dest_tag;
                 lq_rob_idx[free_slot] <= dispatch_rob_idx;
                 lq_opcode[free_slot] <= dispatch_opcode;
-                lq_addr_computed[free_slot] <= 0;
+                lq_addr[free_slot] <= dispatch_base_val + dispatch_imm;
+                lq_addr_computed[free_slot] <= dispatch_base_ready;
                 lq_done[free_slot] <= 0;
                 lq_age[free_slot] <= age_counter;
                 age_counter <= age_counter + 1;
@@ -2748,7 +2747,7 @@ module store_queue(
     input flush
 );
 
-    parameter NUM_ENTRIES = 8;
+    parameter NUM_ENTRIES = 16;
 
     reg sq_valid [0:NUM_ENTRIES-1];
     reg [63:0] sq_addr_base_val [0:NUM_ENTRIES-1];
@@ -2768,7 +2767,7 @@ module store_queue(
 
     // Full detection
     integer vc;
-    reg [3:0] valid_count;
+    reg [4:0] valid_count;
     always @(*) begin
         valid_count = 0;
         for (vc = 0; vc < NUM_ENTRIES; vc = vc + 1)
@@ -2778,14 +2777,14 @@ module store_queue(
 
     // Find free slot
     integer fi;
-    reg [2:0] free_slot;
+    reg [3:0] free_slot;
     reg free_found;
     always @(*) begin
         free_found = 0;
         free_slot = 0;
         for (fi = 0; fi < NUM_ENTRIES; fi = fi + 1) begin
             if (!sq_valid[fi] && !free_found) begin
-                free_slot = fi[2:0];
+                free_slot = fi[3:0];
                 free_found = 1;
             end
         end
@@ -2811,7 +2810,7 @@ module store_queue(
 
     // Commit: find matching entry by rob_idx
     integer cm_i;
-    reg [2:0] commit_slot;
+    reg [3:0] commit_slot;
     reg commit_found;
     always @(*) begin
         commit_found = 0;
@@ -2822,7 +2821,7 @@ module store_queue(
         if (commit_en) begin
             for (cm_i = 0; cm_i < NUM_ENTRIES; cm_i = cm_i + 1) begin
                 if (sq_valid[cm_i] && sq_rob_idx[cm_i] == commit_rob_idx && !commit_found) begin
-                    commit_slot = cm_i[2:0];
+                    commit_slot = cm_i[3:0];
                     commit_found = 1;
                     mem_write_en = 1;
                     mem_write_addr = sq_addr[cm_i];
@@ -2893,18 +2892,27 @@ module store_queue(
                 end
             end
 
-            // Address computation - use first-match priority for ROB addr notification
+            // Address computation - use first-match priority for ROB addr notification.
+            // Include same-cycle CDB wakeup for the address base.
             begin : addr_comp_block
                 reg addr_notified;
                 addr_notified = 0;
                 for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
-                    if (sq_valid[i] && sq_addr_base_ready[i] && !sq_addr_computed[i]) begin
-                        sq_addr[i] <= sq_addr_base_val[i] + sq_imm[i];
+                    reg addr_base_ready_now;
+                    reg [63:0] addr_base_val_now;
+                    addr_base_ready_now = sq_addr_base_ready[i] ||
+                                          (cdb0_valid && sq_addr_base_tag[i] == cdb0_tag) ||
+                                          (cdb1_valid && sq_addr_base_tag[i] == cdb1_tag);
+                    addr_base_val_now = (cdb0_valid && sq_addr_base_tag[i] == cdb0_tag && !sq_addr_base_ready[i]) ? cdb0_value :
+                                        (cdb1_valid && sq_addr_base_tag[i] == cdb1_tag && !sq_addr_base_ready[i]) ? cdb1_value :
+                                        sq_addr_base_val[i];
+                    if (sq_valid[i] && addr_base_ready_now && !sq_addr_computed[i]) begin
+                        sq_addr[i] <= addr_base_val_now + sq_imm[i];
                         sq_addr_computed[i] <= 1;
                         if (!addr_notified) begin
                             rob_store_addr_ready <= 1;
                             rob_store_addr_ready_idx <= sq_rob_idx[i];
-                            rob_store_addr_value <= sq_addr_base_val[i] + sq_imm[i];
+                            rob_store_addr_value <= addr_base_val_now + sq_imm[i];
                             addr_notified = 1;
                         end
                     end
@@ -2928,9 +2936,16 @@ module store_queue(
                 sq_imm[free_slot] <= dispatch_imm;
                 sq_rob_idx[free_slot] <= dispatch_rob_idx;
                 sq_opcode[free_slot] <= dispatch_opcode;
-                sq_addr_computed[free_slot] <= 0;
+                sq_addr[free_slot] <= dispatch_addr_base_val + dispatch_imm;
+                sq_addr_computed[free_slot] <= dispatch_addr_base_ready;
                 sq_age[free_slot] <= age_counter;
                 age_counter <= age_counter + 1;
+
+                if (dispatch_addr_base_ready) begin
+                    rob_store_addr_ready <= 1;
+                    rob_store_addr_ready_idx <= dispatch_rob_idx;
+                    rob_store_addr_value <= dispatch_addr_base_val + dispatch_imm;
+                end
 
                 // If the store data is already known at dispatch, tell the ROB immediately
                 // so a head store doesn't wait forever for a CDB event that will never come.
