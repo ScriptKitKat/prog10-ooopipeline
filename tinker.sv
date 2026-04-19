@@ -264,12 +264,11 @@ module tinker_core(
     wire fpu_rr_after1;
 
     // Does instruction write to rd? (need to allocate phys reg)
-    // Plain branches do not write a destination register.
-    // CALL and RETURN both update r31 per the Prog9 ISA.
-    wire is_branch_no_write1 = is_branch1 && !is_call1;
-    wire is_branch_no_write2 = is_branch2 && !is_call2;
-    wire alloc_preg1 = fu_out_valid1 && !is_halt1 && !is_store1_only && !is_branch_no_write1;
-    wire alloc_preg2 = fu_out_valid2 && !is_halt2 && !is_store2_only && !is_branch_no_write2;
+    // Branches (including CALL and RETURN) do not write a destination register.
+    wire is_branch_no_write1 = is_branch1;
+    wire is_branch_no_write2 = is_branch2;
+    wire alloc_preg1 = fu_out_valid1 && !is_halt1 && !is_store1_only && !is_branch_no_write1 && !is_return1;
+    wire alloc_preg2 = fu_out_valid2 && !is_halt2 && !is_store2_only && !is_branch_no_write2 && !is_return2;
 
     // Determine which arch register to read for each source
     // src1 mapping for instruction 1
@@ -442,6 +441,7 @@ module tinker_core(
                     (opcode1 == 5'h08) || // BR
                     (opcode1 == 5'h09) || // BRR
                     (opcode1 == 5'h0a) || // BRR L
+                    (opcode1 == 5'h0c) || // CALL
                     (opcode1 == 5'h19) || // ADDI
                     (opcode1 == 5'h1b) || // SUBI
                     (opcode1 == 5'h05) || // SHFTRI
@@ -450,6 +450,7 @@ module tinker_core(
     wire src1_dc2 = (opcode2 == 5'h0a);
     wire src2_dc2 = (opcode2 == 5'h03) || (opcode2 == 5'h11) || (opcode2 == 5'h12) ||
                     (opcode2 == 5'h08) || (opcode2 == 5'h09) || (opcode2 == 5'h0a) ||
+                    (opcode2 == 5'h0c) || // CALL
                     (opcode2 == 5'h19) || (opcode2 == 5'h1b) || (opcode2 == 5'h05) ||
                     (opcode2 == 5'h07);
 
@@ -556,8 +557,8 @@ module tinker_core(
     wire [6:0]  lq_disp_base_tag = lq_disp_from1 ? prf_rd1 : prf_rd3;
     wire        lq_disp_base_rdy = lq_disp_from1 ? src1_rdy1 : src1_rdy2;
     wire [63:0] lq_disp_imm      = lq_disp_from1 ?
-                                    (is_return1 ? 64'd0 : dispatch_imm1) :
-                                    (is_return2 ? 64'd0 : dispatch_imm2);
+                                    (is_return1 ? -64'sd8 : dispatch_imm1) :
+                                    (is_return2 ? -64'sd8 : dispatch_imm2);
     wire [6:0]  lq_disp_dest_tag = lq_disp_from1 ? new_phys_rd1 : new_phys_rd2;
     wire [4:0]  lq_disp_rob_idx  = lq_disp_from1 ? rob_alloc_idx1 : rob_alloc_idx2;
     wire [4:0]  lq_disp_opcode   = lq_disp_from1 ? opcode1 : opcode2;
@@ -2035,11 +2036,9 @@ module alu_pipe(
                 // Condition evaluation in stage 1
                 s1_taken_next = (issue_src2 != 64'd0);
             end
-            5'h0c: begin // CALL -> branch to src1 and write back updated r31
+            5'h0c: begin // CALL -> target = src1, taken = 1 (no register write)
                 s1_cat_next = CAT_BRANCH; s1_sub_next = SUB_CALL;
-                s1_isbr_next = 1'b1; s1_hasres_next = 1'b1;
-                s1_opa_next = issue_src2;   // r31
-                s1_opb_next = 64'd8;
+                s1_isbr_next = 1'b1; s1_hasres_next = 1'b0;
                 s1_brtgt_next = issue_src1;
                 s1_taken_next = 1'b1;
             end
@@ -2126,7 +2125,7 @@ module alu_pipe(
                 case (s1_sub_op)
                     SUB_BRR:  s2_brtgt_comb = s1_operand_a + s1_operand_b; // src1 + pc
                     SUB_BRRL: s2_brtgt_comb = s1_operand_a + s1_operand_b; // imm + pc
-                    SUB_CALL: s2_result_comb = s1_operand_a - s1_operand_b; // r31 - 8
+                    SUB_CALL: s2_result_comb = s1_operand_a - s1_operand_b; // unused by CALL
                     SUB_RET:  s2_result_comb = s1_operand_a - s1_operand_b; // src1 - 8
                     SUB_BRGT: s2_brtgt_comb = s1_br_target;
                     default: ; // BR, BRNZ: target already in s1_br_target
@@ -2563,11 +2562,9 @@ module load_queue(
             // CDB output and free entry (respect backpressure)
             if (cdb_found && !cdb_stall) begin
                 if (lq_opcode[cdb_slot] == 5'h0d) begin
-                    // RETURN behaves like a pop: load from mem[r31], resolve the branch
-                    // to that return address, and write back r31 + 8.
-                    cdb_valid <= 1;
-                    cdb_tag <= lq_dest_tag[cdb_slot];
-                    cdb_value <= lq_base_val[cdb_slot] + 64'd8;
+                    // RETURN only resolves the branch. It restores the PC from mem[r31-8]
+                    // and does not write back a register result.
+                    cdb_valid <= 0;
                     br_resolved <= 1;
                     br_taken <= 1;
                     br_target <= lq_mem_data[cdb_slot]; // loaded return address
@@ -3910,6 +3907,7 @@ module alu(
 
     always @(*) begin
         result = 64'b0;
+        writeback = 1'b1;
         branch_target = PC + 64'd4;
         branch_taken = 1'b0;
         case (opcode)
@@ -3931,35 +3929,40 @@ module alu(
             5'h07: result = rd_data << extended_L; // SHFTLI
 
             5'h08: begin // br rd
+                writeback = 1'b0;
                 branch_target = rd_data;
                 branch_taken = 1'b1;
             end
             5'h09: begin // brr rd
+                writeback = 1'b0;
                 branch_target = rd_data + PC;
                 branch_taken = 1'b1;
             end
             5'h0a: begin // brr L
+                writeback = 1'b0;
                 branch_target = extended_L + PC;
                 branch_taken = 1'b1;
             end
 
             5'h0b: begin  // brnz rd, rs
+                writeback = 1'b0;
                 branch_target = rd_data;
                 if (rs_data != 64'b0) begin
                     branch_taken = 1'b1;
                 end
             end
             5'h0c: begin // call
-                // TODO: mem[r31 - 8] = pc + 4
-                result = r31_data - 64'd8;
+                writeback = 1'b0;
                 branch_target = rd_data;
                 branch_taken = 1'b1;
             end
             5'h0d: begin // return
-                result = r31_data - 64'd8; // address of saved PC on stack
+                writeback = 1'b0;
+                branch_target = r31_data - 64'd8; // address of saved PC on stack
                 branch_taken = 1'b1;
             end
             5'h0e: begin // brgt rd, rs, rt
+                writeback = 1'b0;
                 branch_target = rd_data;
                 if (rs_data > rt_data) begin
                     branch_taken = 1'b1;
@@ -3969,15 +3972,21 @@ module alu(
             // mov operations
             5'h10: result = rs_data + extended_L; // mov rd, (rs)(L)
             5'h11: result = rs_data; // mov rd, rs
-            5'h12: result = {rd_data[63:12], extended_L[11:0]}; // MOVI: preserve rd[63:12], L into [11:0]
-            5'h13: result = rd_data + extended_L; // mov (rd)(L), rs
+            5'h12: result = {extended_L[11:0], rd_data[51:0]}; // MOVI: set bits [63:52] to L
+            5'h13: begin
+                writeback = 1'b0;
+                result = rd_data + extended_L; // mov (rd)(L), rs
+            end
             
             // FPU operations in another file: fpu.sv
             5'h14: result = fpu_add_result; // FADD
             5'h15: result = fpu_sub_result; // FSUB
             5'h16: result = fpu_mul_result; // FMUL
             5'h17: result = fpu_div_result; // FDIV
-            default: result = 64'b0;
+            default: begin
+                writeback = 1'b0;
+                result = 64'b0;
+            end
         endcase
     end
 endmodule
