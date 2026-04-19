@@ -162,7 +162,9 @@ module tinker_core(
     // Flush signal (from ROB misprediction)
     // ================================================================
     wire flush = rob_flush_all;
-    wire pipe_kill = rob_flush_all || rob_halt_committed || hlt;
+    // Branch redirects should only flush the frontend/rename state. Older in-flight backend
+    // work must survive so it can still complete and retire ahead of the branch.
+    wire pipe_kill = rob_halt_committed || hlt;
 
     // ================================================================
     // Branch resolution: combine from ALU pipes + LQ with overflow queue
@@ -173,31 +175,45 @@ module tinker_core(
     reg [63:0] br_deferred_target;
     reg [4:0]  br_deferred_rob_idx;
 
-    // Count how many sources are resolving this cycle
+    // Count how many new sources are resolving this cycle
     wire [1:0] br_resolve_count = {1'b0, alu0_br_resolved} + {1'b0, alu1_br_resolved} + {1'b0, lq_br_resolved};
 
-    // Include deferred resolution as a source (lowest priority)
-    wire        br_resolved_combined = alu0_br_resolved || alu1_br_resolved || lq_br_resolved || br_deferred_valid;
-    wire        br_taken_combined    = alu0_br_resolved ? alu0_br_taken :
+    // If a branch resolution was deferred from last cycle, service it first so it can't be
+    // overwritten by a newer branch resolving in the same cycle.
+    wire        br_resolved_combined = br_deferred_valid || alu0_br_resolved || alu1_br_resolved || lq_br_resolved;
+    wire        br_taken_combined    = br_deferred_valid ? br_deferred_taken :
+                                       alu0_br_resolved ? alu0_br_taken :
                                        alu1_br_resolved ? alu1_br_taken :
-                                       lq_br_resolved   ? lq_br_taken : br_deferred_taken;
-    wire [63:0] br_target_combined   = alu0_br_resolved ? alu0_br_target :
+                                       lq_br_resolved   ? lq_br_taken : 1'b0;
+    wire [63:0] br_target_combined   = br_deferred_valid ? br_deferred_target :
+                                       alu0_br_resolved ? alu0_br_target :
                                        alu1_br_resolved ? alu1_br_target :
-                                       lq_br_resolved   ? lq_br_target : br_deferred_target;
-    wire [4:0]  br_rob_idx_combined  = alu0_br_resolved ? alu0_br_rob_idx :
+                                       lq_br_resolved   ? lq_br_target : 64'd0;
+    wire [4:0]  br_rob_idx_combined  = br_deferred_valid ? br_deferred_rob_idx :
+                                       alu0_br_resolved ? alu0_br_rob_idx :
                                        alu1_br_resolved ? alu1_br_rob_idx :
-                                       lq_br_resolved   ? lq_br_rob_idx : br_deferred_rob_idx;
+                                       lq_br_resolved   ? lq_br_rob_idx : 5'd0;
 
-    // Determine if a second resolution is being dropped and needs deferral
-    // Second resolution = the one NOT selected by the priority encoder above
-    wire br_second_valid = (br_resolve_count > 2'd1);
-    wire        br_second_taken  = alu0_br_resolved && alu1_br_resolved ? alu1_br_taken :
+    // If we're servicing a deferred branch, defer the oldest new resolution (if any).
+    // Otherwise, if multiple new resolutions arrive together, defer the second one.
+    wire br_second_valid = br_deferred_valid ? (alu0_br_resolved || alu1_br_resolved || lq_br_resolved) :
+                                             (br_resolve_count > 2'd1);
+    wire        br_second_taken  = br_deferred_valid ? (alu0_br_resolved ? alu0_br_taken :
+                                                        alu1_br_resolved ? alu1_br_taken :
+                                                        lq_br_taken) :
+                                   alu0_br_resolved && alu1_br_resolved ? alu1_br_taken :
                                    alu0_br_resolved && lq_br_resolved   ? lq_br_taken :
                                    alu1_br_resolved && lq_br_resolved   ? lq_br_taken : 1'b0;
-    wire [63:0] br_second_target = alu0_br_resolved && alu1_br_resolved ? alu1_br_target :
+    wire [63:0] br_second_target = br_deferred_valid ? (alu0_br_resolved ? alu0_br_target :
+                                                         alu1_br_resolved ? alu1_br_target :
+                                                         lq_br_target) :
+                                   alu0_br_resolved && alu1_br_resolved ? alu1_br_target :
                                    alu0_br_resolved && lq_br_resolved   ? lq_br_target :
                                    alu1_br_resolved && lq_br_resolved   ? lq_br_target : 64'd0;
-    wire [4:0]  br_second_rob    = alu0_br_resolved && alu1_br_resolved ? alu1_br_rob_idx :
+    wire [4:0]  br_second_rob    = br_deferred_valid ? (alu0_br_resolved ? alu0_br_rob_idx :
+                                                         alu1_br_resolved ? alu1_br_rob_idx :
+                                                         lq_br_rob_idx) :
+                                   alu0_br_resolved && alu1_br_resolved ? alu1_br_rob_idx :
                                    alu0_br_resolved && lq_br_resolved   ? lq_br_rob_idx :
                                    alu1_br_resolved && lq_br_resolved   ? lq_br_rob_idx : 5'd0;
 
@@ -744,7 +760,7 @@ module tinker_core(
         .snap1_wr_override(alloc_preg1 && dispatch_valid1 && rat_same_dest),
         .snap1_wr_areg(dest_areg1),
         .snap1_wr_preg(new_phys_rd1),
-        .restore_en(flush),
+        .restore_en(1'b0),
         .restore_id(rob_mispredict_snap_id)
     );
 
@@ -774,7 +790,7 @@ module tinker_core(
         .snap1_wr_override(alloc_preg1 && dispatch_valid1 && rat_same_dest),
         .snap1_wr_areg(dest_areg1),
         .snap1_wr_preg(new_phys_rd1),
-        .restore_en(flush),
+        .restore_en(1'b0),
         .restore_id(rob_mispredict_snap_id)
     );
 
@@ -810,7 +826,7 @@ module tinker_core(
         .snap_id1(snap_id1),
         .snap_en2(take_snap2),
         .snap_id2(snap_id2),
-        .restore_en(flush),
+        .restore_en(1'b0),
         .restore_id(rob_mispredict_snap_id)
     );
 
