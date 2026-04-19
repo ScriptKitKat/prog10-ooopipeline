@@ -2061,10 +2061,10 @@ module alu_pipe(
                 s1_cat_next = CAT_MOVE; s1_sub_next = SUB_MOV;
                 s1_opa_next = issue_src1;
             end
-            5'h12: begin // MOVI -> result = {L[11:0], rd[51:0]}
+            5'h12: begin // MOVI -> result = {rd[63:12], L[11:0]}
                 s1_cat_next = CAT_MOVE; s1_sub_next = SUB_MOVI;
-                s1_opa_next = issue_src1; // rd value (lower 52 bits preserved)
-                s1_opb_next = issue_imm;  // literal goes into bits [63:52]
+                s1_opa_next = issue_src1; // preserve upper 52 bits
+                s1_opb_next = issue_imm;  // literal goes into low 12 bits
             end
 
             default: begin
@@ -2135,7 +2135,7 @@ module alu_pipe(
             CAT_MOVE: begin
                 case (s1_sub_op)
                     SUB_MOV:  s2_result_comb = s1_operand_a;
-                    SUB_MOVI: s2_result_comb = {s1_operand_b[11:0], s1_operand_a[51:0]};
+                    SUB_MOVI: s2_result_comb = {s1_operand_a[63:12], s1_operand_b[11:0]};
                     default:  s2_result_comb = 64'd0;
                 endcase
             end
@@ -3972,7 +3972,7 @@ module alu(
             // mov operations
             5'h10: result = rs_data + extended_L; // mov rd, (rs)(L)
             5'h11: result = rs_data; // mov rd, rs
-            5'h12: result = {extended_L[11:0], rd_data[51:0]}; // MOVI: set bits [63:52] to L
+            5'h12: result = {rd_data[63:12], extended_L[11:0]}; // MOVI: set low 12 bits to L
             5'h13: begin
                 writeback = 1'b0;
                 result = rd_data + extended_L; // mov (rd)(L), rs
