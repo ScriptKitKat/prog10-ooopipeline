@@ -99,13 +99,12 @@ module test_branches;
             fail_count = fail_count+1;
         end
 
-        // === BRGT rd, rs, rt (branch if rs > rt, target = PC + L, where L encodes offset) ===
+        // === BRGT rd, rs, rt (branch if rs > rt, target = rd) ===
         reset = 1; #2;
+        dut.reg_file.registers[4] = 64'h2008;  // target
         dut.reg_file.registers[1] = 64'd10;    // rs = 10
         dut.reg_file.registers[2] = 64'd5;     // rt = 5
-        // brgt rd, rs, rt: opcode=0x0e, rd encodes L (imm), rs=1, rt=2
-        // target = PC + imm, L = 8 → target = 0x2000 + 8 = 0x2008
-        store_instr(64'h2000, mk_instr(5'h0e, 5'd0, 5'd1, 5'd2, 12'd8));
+        store_instr(64'h2000, mk_instr(5'h0e, 5'd4, 5'd1, 5'd2, 12'd0));
         store_instr(64'h2004, mk_instr(5'h19, 5'd3, 5'd0, 5'd0, 12'd99));  // skipped
         store_instr(64'h2008, mk_instr(5'h0f, 5'd0, 5'd0, 5'd0, 12'd0));  // halt
         #8; run_and_wait;
@@ -113,6 +112,24 @@ module test_branches;
             $display("PASS brgt cycles=%0d", cycle_count); pass_count = pass_count+1;
         end else begin
             $display("FAIL brgt cycles=%0d r3=%0d timeout=%b", cycle_count, dut.reg_file.registers[3], cycle_count>=300);
+            fail_count = fail_count+1;
+        end
+
+        // BRGT should wait for recently-produced target and compare operands.
+        reset = 1; #2;
+        dut.reg_file.registers[4] = 64'h200c;
+        store_instr(64'h2000, mk_instr(5'h19, 5'd4, 5'd0, 5'd0, 12'd8));   // r4 = 0x2014
+        store_instr(64'h2004, mk_instr(5'h19, 5'd1, 5'd0, 5'd0, 12'd10));  // r1 = 10
+        store_instr(64'h2008, mk_instr(5'h19, 5'd2, 5'd0, 5'd0, 12'd5));   // r2 = 5
+        store_instr(64'h200c, mk_instr(5'h0e, 5'd4, 5'd1, 5'd2, 12'd0));   // brgt r4,r1,r2
+        store_instr(64'h2010, mk_instr(5'h19, 5'd3, 5'd0, 5'd0, 12'd99));  // skipped
+        store_instr(64'h2014, mk_instr(5'h0f, 5'd0, 5'd0, 5'd0, 12'd0));
+        #8; run_and_wait;
+        if (cycle_count < 300 && dut.reg_file.registers[3] === 64'd0 && dut.reg_file.registers[4] === 64'h2014) begin
+            $display("PASS brgt_deps cycles=%0d", cycle_count); pass_count = pass_count+1;
+        end else begin
+            $display("FAIL brgt_deps cycles=%0d r3=%0d r4=%0d timeout=%b",
+                     cycle_count, dut.reg_file.registers[3], dut.reg_file.registers[4], cycle_count>=300);
             fail_count = fail_count+1;
         end
 

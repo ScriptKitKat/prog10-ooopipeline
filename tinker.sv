@@ -292,25 +292,27 @@ module tinker_core(
                             (opcode1 == 5'h19 || opcode1 == 5'h1b ||
                              opcode1 == 5'h05 || opcode1 == 5'h07 ||
                              opcode1 == 5'h12) ? rd1 :   // ADDI,SUBI,SHFTRI,SHFTLI,MOVI read rd
+                            (opcode1 == 5'h0e) ? rd1 :   // BRGT reads rd as branch target
                             (opcode1 == 5'h08 || opcode1 == 5'h09 ||
                              opcode1 == 5'h0b || opcode1 == 5'h0c) ? rd1 :   // BR,BRR,BRNZ,CALL read rd as target
-                            rs1;                          // default: rs (also BRGT: src1=rs)
+                            rs1;                          // default: rs
     // src2 mapping for instruction 1
-    wire [4:0] src2_areg1 = (opcode1 == 5'h0b) ? rs1 :  // BRNZ: src2=rs (condition)
+    wire [4:0] src2_areg1 = (opcode1 == 5'h0b || opcode1 == 5'h0e) ? rs1 :  // BRNZ/BRGT condition
                             (opcode1 == 5'h0c) ? 5'd31 : // CALL: src2=r31
-                            rt1;                          // default: rt (also BRGT: src2=rt)
+                            rt1;                          // default: rt
 
     // src1 mapping for instruction 2
     wire [4:0] src1_areg2 = (opcode2 == 5'h0d) ? 5'd31 :
                             (opcode2 == 5'h19 || opcode2 == 5'h1b ||
                              opcode2 == 5'h05 || opcode2 == 5'h07 ||
                              opcode2 == 5'h12) ? rd2 :
+                            (opcode2 == 5'h0e) ? rd2 :
                             (opcode2 == 5'h08 || opcode2 == 5'h09 ||
                              opcode2 == 5'h0b || opcode2 == 5'h0c) ? rd2 :
-                            rs2;  // default: rs (also BRGT: src1=rs)
-    wire [4:0] src2_areg2 = (opcode2 == 5'h0b) ? rs2 :
+                            rs2;  // default: rs
+    wire [4:0] src2_areg2 = (opcode2 == 5'h0b || opcode2 == 5'h0e) ? rs2 :
                             (opcode2 == 5'h0c) ? 5'd31 :
-                            rt2;  // default: rt (also BRGT: src2=rt)
+                            rt2;  // default: rt
 
     // For stores: addr_base is rd, data is rs
     wire [4:0] store_addr_areg1 = rd1;
@@ -347,7 +349,8 @@ module tinker_core(
 
     wire [4:0] rat_rd_sel1 = is_store1_only ? store_addr_areg1 : is_load1 ? load_base_areg1 : src1_areg1;
     wire [4:0] rat_rd_sel2 = is_store1_only ? store_data_areg1 : src2_areg1;
-    wire [4:0] rat_rd_sel3 = is_store2_only ? store_addr_areg2 : is_load2 ? load_base_areg2 : src1_areg2;
+    wire [4:0] rat_rd_sel3 = (opcode1 == 5'h0e) ? rt1 :
+                              is_store2_only ? store_addr_areg2 : is_load2 ? load_base_areg2 : src1_areg2;
     wire [4:0] rat_rd_sel4 = is_store2_only ? store_data_areg2 : src2_areg2;
 
     assign phys_src1_1 = rat_read_preg1;
@@ -402,7 +405,7 @@ module tinker_core(
     wire slot2_singleq_conflict =
         ((is_load1 || is_return1) && (is_load2 || is_return2)) ||
         ((is_store1_only || is_call1) && (is_store2_only || is_call2));
-    wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 && (is_branch1 || is_return1);
+    wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 && (is_branch1 || is_return1 || is_branch2 || is_return2);
     wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
 
     assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 || rob_has_unresolved_branch ||
@@ -473,7 +476,7 @@ module tinker_core(
     // PRF read port selectors (physical register IDs)
     wire [6:0] prf_rd1 = ren_phys_src1_1;
     wire [6:0] prf_rd2 = ren_phys_src2_1_final;
-    wire [6:0] prf_rd3 = ren_phys_src1_2;
+    wire [6:0] prf_rd3 = (opcode1 == 5'h0e) ? rat_read_preg3 : ren_phys_src1_2;
     wire [6:0] prf_rd4 = ren_phys_src2_2_final;
 
     // Source ready and value for RS dispatch (combining PRF read + CDB bypass)
@@ -508,10 +511,21 @@ module tinker_core(
                             (cdb1_valid && cdb1_tag == prf_rd4 && (!prf_read_ready4 || intra_dep_src2_2)) ? cdb1_value :
                             prf_read_data4;
 
+    wire src3_rdy1 = (opcode1 != 5'h0e) || prf_read_ready3 ||
+                     (cdb0_valid && cdb0_tag == prf_rd3) ||
+                     (cdb1_valid && cdb1_tag == prf_rd3);
+    wire [63:0] src3_val1 = (cdb0_valid && cdb0_tag == prf_rd3 && !prf_read_ready3) ? cdb0_value :
+                            (cdb1_valid && cdb1_tag == prf_rd3 && !prf_read_ready3) ? cdb1_value :
+                            prf_read_data3;
+
     // IMM field for dispatch
-    // IMM field: sign-extended L for all instructions
-    wire [63:0] dispatch_imm1 = imm1;
+    // IMM field carries the literal for normal ops and BRGT's rt operand for comparison.
+    wire [63:0] dispatch_imm1 = (opcode1 == 5'h0e) ? src3_val1 : imm1;
     wire [63:0] dispatch_imm2 = imm2;
+    wire [6:0]  dispatch_imm_tag1 = (opcode1 == 5'h0e) ? prf_rd3 : 7'd0;
+    wire [6:0]  dispatch_imm_tag2 = 7'd0;
+    wire        dispatch_imm_rdy1 = (opcode1 == 5'h0e) ? src3_rdy1 : 1'b1;
+    wire        dispatch_imm_rdy2 = 1'b1;
 
 
     // ================================================================
@@ -528,6 +542,8 @@ module tinker_core(
     wire [6:0]  alu0_disp_dest     = disp1_to_alu0 ? new_phys_rd1 : new_phys_rd2;
     wire [4:0]  alu0_disp_rob_idx  = disp1_to_alu0 ? rob_alloc_idx1 : rob_alloc_idx2;
     wire [63:0] alu0_disp_imm      = disp1_to_alu0 ? dispatch_imm1 : dispatch_imm2;
+    wire [6:0]  alu0_disp_imm_tag  = disp1_to_alu0 ? dispatch_imm_tag1 : dispatch_imm_tag2;
+    wire        alu0_disp_imm_rdy  = disp1_to_alu0 ? dispatch_imm_rdy1 : dispatch_imm_rdy2;
     wire [63:0] alu0_disp_pc       = disp1_to_alu0 ? fu_out_pc1 : fu_out_pc2;
 
     wire [4:0]  alu1_disp_opcode = disp1_to_alu1 ? opcode1 : opcode2;
@@ -540,6 +556,8 @@ module tinker_core(
     wire [6:0]  alu1_disp_dest     = disp1_to_alu1 ? new_phys_rd1 : new_phys_rd2;
     wire [4:0]  alu1_disp_rob_idx  = disp1_to_alu1 ? rob_alloc_idx1 : rob_alloc_idx2;
     wire [63:0] alu1_disp_imm      = disp1_to_alu1 ? dispatch_imm1 : dispatch_imm2;
+    wire [6:0]  alu1_disp_imm_tag  = disp1_to_alu1 ? dispatch_imm_tag1 : dispatch_imm_tag2;
+    wire        alu1_disp_imm_rdy  = disp1_to_alu1 ? dispatch_imm_rdy1 : dispatch_imm_rdy2;
     wire [63:0] alu1_disp_pc       = disp1_to_alu1 ? fu_out_pc1 : fu_out_pc2;
 
     wire [4:0]  fpu0_disp_opcode = disp1_to_fpu0 ? opcode1 : opcode2;
@@ -902,6 +920,8 @@ module tinker_core(
         .dispatch_dest_tag(alu0_disp_dest),
         .dispatch_rob_idx(alu0_disp_rob_idx),
         .dispatch_imm(alu0_disp_imm),
+        .dispatch_imm_tag(alu0_disp_imm_tag),
+        .dispatch_imm_rdy(alu0_disp_imm_rdy),
         .dispatch_pc(alu0_disp_pc),
         .cdb0_valid(cdb0_valid), .cdb0_tag(cdb0_tag), .cdb0_value(cdb0_value),
         .cdb1_valid(cdb1_valid), .cdb1_tag(cdb1_tag), .cdb1_value(cdb1_value),
@@ -931,6 +951,8 @@ module tinker_core(
         .dispatch_dest_tag(alu1_disp_dest),
         .dispatch_rob_idx(alu1_disp_rob_idx),
         .dispatch_imm(alu1_disp_imm),
+        .dispatch_imm_tag(alu1_disp_imm_tag),
+        .dispatch_imm_rdy(alu1_disp_imm_rdy),
         .dispatch_pc(alu1_disp_pc),
         .cdb0_valid(cdb0_valid), .cdb0_tag(cdb0_tag), .cdb0_value(cdb0_value),
         .cdb1_valid(cdb1_valid), .cdb1_tag(cdb1_tag), .cdb1_value(cdb1_value),
@@ -960,6 +982,8 @@ module tinker_core(
         .dispatch_dest_tag(fpu0_disp_dest),
         .dispatch_rob_idx(fpu0_disp_rob_idx),
         .dispatch_imm(fpu0_disp_imm),
+        .dispatch_imm_tag(7'd0),
+        .dispatch_imm_rdy(1'b1),
         .dispatch_pc(fpu0_disp_pc),
         .cdb0_valid(cdb0_valid), .cdb0_tag(cdb0_tag), .cdb0_value(cdb0_value),
         .cdb1_valid(cdb1_valid), .cdb1_tag(cdb1_tag), .cdb1_value(cdb1_value),
@@ -989,6 +1013,8 @@ module tinker_core(
         .dispatch_dest_tag(fpu1_disp_dest),
         .dispatch_rob_idx(fpu1_disp_rob_idx),
         .dispatch_imm(fpu1_disp_imm),
+        .dispatch_imm_tag(7'd0),
+        .dispatch_imm_rdy(1'b1),
         .dispatch_pc(fpu1_disp_pc),
         .cdb0_valid(cdb0_valid), .cdb0_tag(cdb0_tag), .cdb0_value(cdb0_value),
         .cdb1_valid(cdb1_valid), .cdb1_tag(cdb1_tag), .cdb1_value(cdb1_value),
@@ -1688,6 +1714,8 @@ module reservation_station #(
     input [6:0] dispatch_dest_tag,
     input [4:0] dispatch_rob_idx,
     input [63:0] dispatch_imm,
+    input [6:0] dispatch_imm_tag,
+    input dispatch_imm_rdy,
     input [63:0] dispatch_pc,
 
     // CDB snoop (2 buses)
@@ -1726,6 +1754,8 @@ module reservation_station #(
     reg [6:0] dest_tag [0:NUM_ENTRIES-1];
     reg [4:0] rob_idx [0:NUM_ENTRIES-1];
     reg [63:0] imm [0:NUM_ENTRIES-1];
+    reg [6:0] imm_tag [0:NUM_ENTRIES-1];
+    reg imm_rdy [0:NUM_ENTRIES-1];
     reg [63:0] pc [0:NUM_ENTRIES-1];
     reg [4:0] age [0:NUM_ENTRIES-1];
 
@@ -1766,7 +1796,7 @@ module reservation_station #(
         issue_slot = 0;
         issue_min_age = 5'h1f;
         for (s_idx = 0; s_idx < NUM_ENTRIES; s_idx = s_idx + 1) begin
-            if (valid[s_idx] && src1_rdy[s_idx] && src2_rdy[s_idx]) begin
+            if (valid[s_idx] && src1_rdy[s_idx] && src2_rdy[s_idx] && imm_rdy[s_idx]) begin
                 if (!issue_found || age[s_idx] < issue_min_age) begin
                     issue_slot = s_idx[$clog2(NUM_ENTRIES)-1:0];
                     issue_min_age = age[s_idx];
@@ -1806,6 +1836,7 @@ module reservation_station #(
                 valid[i] <= 0;
                 src1_rdy[i] <= 0;
                 src2_rdy[i] <= 0;
+                imm_rdy[i] <= 0;
             end
             age_counter <= 0;
         end else begin
@@ -1828,6 +1859,14 @@ module reservation_station #(
                         src2_val[i] <= cdb1_value;
                         src2_rdy[i] <= 1;
                     end
+                    if (!imm_rdy[i] && cdb0_valid && imm_tag[i] == cdb0_tag) begin
+                        imm[i] <= cdb0_value;
+                        imm_rdy[i] <= 1;
+                    end
+                    if (!imm_rdy[i] && cdb1_valid && imm_tag[i] == cdb1_tag) begin
+                        imm[i] <= cdb1_value;
+                        imm_rdy[i] <= 1;
+                    end
                 end
             end
 
@@ -1849,6 +1888,8 @@ module reservation_station #(
                 dest_tag[free_slot] <= dispatch_dest_tag;
                 rob_idx[free_slot] <= dispatch_rob_idx;
                 imm[free_slot] <= dispatch_imm;
+                imm_tag[free_slot] <= dispatch_imm_tag;
+                imm_rdy[free_slot] <= dispatch_imm_rdy;
                 pc[free_slot] <= dispatch_pc;
                 age[free_slot] <= age_counter;
                 age_counter <= age_counter + 1;
@@ -2063,13 +2104,11 @@ module alu_pipe(
                 s1_brtgt_next = 64'd0;
                 s1_taken_next = 1'b1;
             end
-            5'h0e: begin // BRGT rd, rs, rt -> target = PC + L, taken = (rs > rt)
+            5'h0e: begin // BRGT rd, rs, rt -> target = rd, taken = (rs > rt)
                 s1_cat_next = CAT_BRANCH; s1_sub_next = SUB_BRGT;
                 s1_isbr_next = 1'b1; s1_hasres_next = 1'b0;
-                // Prepare operands for target addition in stage 2 (imm + pc)
-                s1_opa_next = issue_imm; s1_opb_next = issue_pc;
-                // Condition: rs > rt (src1 > src2)
-                s1_taken_next = (issue_src1 > issue_src2);
+                s1_brtgt_next = issue_src1;
+                s1_taken_next = (issue_src2 > issue_imm);
             end
 
             // --- Move ---
@@ -2143,7 +2182,7 @@ module alu_pipe(
                     SUB_BRRL: s2_brtgt_comb = s1_operand_a + s1_operand_b; // imm + pc
                     SUB_CALL: s2_result_comb = s1_operand_a - s1_operand_b; // unused by CALL
                     SUB_RET:  s2_result_comb = s1_operand_a - s1_operand_b; // src1 - 8
-                    SUB_BRGT: s2_brtgt_comb = s1_operand_a + s1_operand_b; // imm + pc
+                    SUB_BRGT: ; // target already in s1_br_target
                     default: ; // BR, BRNZ: target already in s1_br_target
                 endcase
             end
