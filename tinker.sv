@@ -685,7 +685,7 @@ module tinker_core(
     wire [63:0] lq_mem_read_data_wire;
 
     // --- Memory ---
-    memory memory(
+    memory_unit memory(
         .clk(clk),
         .reset(reset),
         .PC(64'd0),                          // legacy port, tied off
@@ -869,7 +869,7 @@ module tinker_core(
     wire arf_same_dest = arf_wen1_raw && arf_wen2_raw &&
                          (rob_commit_arch_rd1 == rob_commit_arch_rd2);
     // Suppress older write (port 1) when both write same register
-    reg_file reg_file(
+    reg_file_unit reg_file(
         .clk(clk),
         .reset(reset),
         .write_en1(arf_wen1_raw && !arf_same_dest),
@@ -1053,7 +1053,7 @@ module tinker_core(
     );
 
     // --- FPU (wrapper containing both FPU pipes) ---
-    fpu fpu(
+    fpu_unit fpu(
         .clk(clk), .rst(reset),
         .pipe0_issue_valid(rs_fpu0_issue_valid),
         .pipe0_issue_opcode(rs_fpu0_issue_opcode),
@@ -1286,7 +1286,7 @@ module instruction_decoder(
     end
 endmodule
 
-module memory(
+module memory_unit(
     input clk,
     input reset,
     input [63:0] PC,
@@ -1338,7 +1338,7 @@ module memory(
     end
 endmodule
 
-module reg_file(
+module reg_file_unit(
     input clk,
     input reset,
     // Write port 1
@@ -2312,7 +2312,7 @@ endmodule
 // ============================================================================
 // FPU Wrapper (contains both FPU pipe instances)
 // ============================================================================
-module fpu(
+module fpu_unit(
     input clk,
     input rst,
 
