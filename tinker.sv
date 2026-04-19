@@ -1761,6 +1761,30 @@ module reservation_station #(
 
     reg [4:0] age_counter;
 
+    function automatic wakeup_ready;
+        input src_ready;
+        input [6:0] src_tag;
+        begin
+            wakeup_ready = src_ready ||
+                           (cdb0_valid && src_tag == cdb0_tag) ||
+                           (cdb1_valid && src_tag == cdb1_tag);
+        end
+    endfunction
+
+    function automatic [63:0] wakeup_value;
+        input src_ready;
+        input [63:0] src_value;
+        input [6:0] src_tag;
+        begin
+            if (!src_ready && cdb0_valid && src_tag == cdb0_tag)
+                wakeup_value = cdb0_value;
+            else if (!src_ready && cdb1_valid && src_tag == cdb1_tag)
+                wakeup_value = cdb1_value;
+            else
+                wakeup_value = src_value;
+        end
+    endfunction
+
     // Full detection: count valid entries
     integer v;
     reg [$clog2(NUM_ENTRIES):0] valid_count;
@@ -1796,7 +1820,10 @@ module reservation_station #(
         issue_slot = 0;
         issue_min_age = 5'h1f;
         for (s_idx = 0; s_idx < NUM_ENTRIES; s_idx = s_idx + 1) begin
-            if (valid[s_idx] && src1_rdy[s_idx] && src2_rdy[s_idx] && imm_rdy[s_idx]) begin
+            if (valid[s_idx] &&
+                wakeup_ready(src1_rdy[s_idx], src1_tag[s_idx]) &&
+                wakeup_ready(src2_rdy[s_idx], src2_tag[s_idx]) &&
+                wakeup_ready(imm_rdy[s_idx], imm_tag[s_idx])) begin
                 if (!issue_found || age[s_idx] < issue_min_age) begin
                     issue_slot = s_idx[$clog2(NUM_ENTRIES)-1:0];
                     issue_min_age = age[s_idx];
@@ -1811,11 +1838,11 @@ module reservation_station #(
         issue_valid = issue_found;
         if (issue_found) begin
             issue_opcode = opcode[issue_slot];
-            issue_src1_val = src1_val[issue_slot];
-            issue_src2_val = src2_val[issue_slot];
+            issue_src1_val = wakeup_value(src1_rdy[issue_slot], src1_val[issue_slot], src1_tag[issue_slot]);
+            issue_src2_val = wakeup_value(src2_rdy[issue_slot], src2_val[issue_slot], src2_tag[issue_slot]);
             issue_dest_tag = dest_tag[issue_slot];
             issue_rob_idx = rob_idx[issue_slot];
-            issue_imm = imm[issue_slot];
+            issue_imm = wakeup_value(imm_rdy[issue_slot], imm[issue_slot], imm_tag[issue_slot]);
             issue_pc = pc[issue_slot];
         end else begin
             issue_opcode = 0;
@@ -2132,8 +2159,8 @@ module alu_pipe(
         endcase
     end
 
-    // Can accept new issue when stage 1 is free and not held by CDB backpressure
-    assign issue_ready = (!s1_valid && !cdb_stall) || flush;
+    // Stage 1 advances every cycle, so the pipe can accept a new op each cycle.
+    assign issue_ready = !cdb_stall || flush;
 
     // ========================================================================
     // Stage 2 combinational logic: Execute / Result Generation
@@ -2297,7 +2324,7 @@ module fpu_pipe(
         endcase
     end
 
-    assign issue_ready = (!s1_valid && !cdb_stall) || flush;
+    assign issue_ready = !cdb_stall || flush;
 
     always @(posedge clk or posedge rst) begin
         if (rst || flush) begin
