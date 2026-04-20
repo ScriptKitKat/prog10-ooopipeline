@@ -711,8 +711,18 @@ module tinker_core(
         (opcode1 == 5'h0a) ? (fu_out_pc1 + imm1) :
                               src1_val1;
     wire branch_pred1 = dispatch_valid1 && is_branch1 && branch1_target_ready;
-    wire branch_pred2 = 1'b0;
-    wire pred_redirect = branch_pred1;
+    wire branch2_target_ready =
+        (opcode2 == 5'h0a) ? 1'b1 :
+        (opcode2 == 5'h08 || opcode2 == 5'h09 || opcode2 == 5'h0b ||
+         opcode2 == 5'h0c || opcode2 == 5'h0e) ? src1_rdy2 :
+        1'b0;
+    wire [63:0] branch2_pred_target =
+        (opcode2 == 5'h09) ? (fu_out_pc2 + src1_val2) :
+        (opcode2 == 5'h0a) ? (fu_out_pc2 + imm2) :
+                              src1_val2;
+    wire branch_pred2 = dispatch_valid2 && is_branch2 && branch2_target_ready && !branch_pred1;
+    wire pred_redirect = branch_pred1 || branch_pred2;
+    wire [63:0] pred_redirect_pc = branch_pred1 ? branch1_pred_target : branch2_pred_target;
 
     // ================================================================
     // Snapshot ID management for branch RAT checkpoints
@@ -745,7 +755,7 @@ module tinker_core(
             // On flush, keep RR state (or reset - doesn't matter much)
             alu_rr <= 1'b0;
             fpu_rr <= 1'b0;
-            post_flush_stall <= 3'd5;
+            post_flush_stall <= 3'd2;
             // If a previously deferred branch is being serviced this cycle, free its
             // checkpoint slot even though flush bypasses the normal resolved-branch path.
             if (br_resolved_combined) begin
@@ -857,7 +867,7 @@ module tinker_core(
         .flush(flush || pipe_kill),
         .redirect_pc(rob_mispredict_target),
         .pred_redirect(pred_redirect),
-        .pred_redirect_pc(branch1_pred_target)
+        .pred_redirect_pc(pred_redirect_pc)
     );
 
     // --- Instruction Decoders ---
