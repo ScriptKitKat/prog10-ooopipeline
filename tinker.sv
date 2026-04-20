@@ -219,8 +219,14 @@ module tinker_core(
                                    alu1_br_resolved && lq_br_resolved   ? lq_br_rob_idx : 5'd0;
 
     always @(posedge clk or posedge reset) begin
-        if (reset || pipe_kill || flush) begin
+        if (reset || pipe_kill) begin
             br_deferred_valid <= 1'b0;
+        end else if (flush) begin
+            // Only discard the deferred resolution if it belongs to a flushed entry.
+            // If it's for an older (still-valid) entry, keep it so the ROB can retire it.
+            if (br_deferred_valid &&
+                rob_idx_after(br_deferred_rob_idx, rob_mispredict_rob_idx, rob_mispredict_tail))
+                br_deferred_valid <= 1'b0;
         end else if (br_second_valid) begin
             // A second branch resolved this cycle; defer it to next cycle
             br_deferred_valid     <= 1'b1;
@@ -246,30 +252,35 @@ module tinker_core(
     wire [63:0] imm2 = {{52{L2[11]}}, L2};
 
     // Instruction classification for slot 1
-    wire is_alu1  = (opcode1 >= 5'h18 && opcode1 <= 5'h1d) ||
+    wire opcode1_known = !(^opcode1 === 1'bx);
+    wire opcode2_known = !(^opcode2 === 1'bx);
+    wire instr_valid1 = fu_out_valid1 && opcode1_known;
+    wire instr_valid2 = fu_out_valid2 && opcode2_known;
+
+    wire is_alu1  = opcode1_known && ((opcode1 >= 5'h18 && opcode1 <= 5'h1d) ||
                     (opcode1 >= 5'h00 && opcode1 <= 5'h07) ||
                     (opcode1 >= 5'h08 && opcode1 <= 5'h0e && opcode1 != 5'h0d) ||
-                    (opcode1 == 5'h11) || (opcode1 == 5'h12);
-    wire is_fpu1  = (opcode1 >= 5'h14 && opcode1 <= 5'h17);
-    wire is_load1 = (opcode1 == 5'h10);
-    wire is_store1= (opcode1 == 5'h13);
-    wire is_halt1 = (opcode1 == 5'h0f);
-    wire is_branch1 = (opcode1 >= 5'h08 && opcode1 <= 5'h0e) && (opcode1 != 5'h0d);
-    wire is_call1 = (opcode1 == 5'h0c);
-    wire is_return1 = (opcode1 == 5'h0d);
+                    (opcode1 == 5'h11) || (opcode1 == 5'h12));
+    wire is_fpu1  = opcode1_known && (opcode1 >= 5'h14 && opcode1 <= 5'h17);
+    wire is_load1 = opcode1_known && (opcode1 == 5'h10);
+    wire is_store1= opcode1_known && (opcode1 == 5'h13);
+    wire is_halt1 = opcode1_known && (opcode1 == 5'h0f);
+    wire is_branch1 = opcode1_known && (opcode1 >= 5'h08 && opcode1 <= 5'h0e) && (opcode1 != 5'h0d);
+    wire is_call1 = opcode1_known && (opcode1 == 5'h0c);
+    wire is_return1 = opcode1_known && (opcode1 == 5'h0d);
 
     // Instruction classification for slot 2
-    wire is_alu2  = (opcode2 >= 5'h18 && opcode2 <= 5'h1d) ||
+    wire is_alu2  = opcode2_known && ((opcode2 >= 5'h18 && opcode2 <= 5'h1d) ||
                     (opcode2 >= 5'h00 && opcode2 <= 5'h07) ||
                     (opcode2 >= 5'h08 && opcode2 <= 5'h0e && opcode2 != 5'h0d) ||
-                    (opcode2 == 5'h11) || (opcode2 == 5'h12);
-    wire is_fpu2  = (opcode2 >= 5'h14 && opcode2 <= 5'h17);
-    wire is_load2 = (opcode2 == 5'h10);
-    wire is_store2= (opcode2 == 5'h13);
-    wire is_halt2 = (opcode2 == 5'h0f);
-    wire is_branch2 = (opcode2 >= 5'h08 && opcode2 <= 5'h0e) && (opcode2 != 5'h0d);
-    wire is_call2 = (opcode2 == 5'h0c);
-    wire is_return2 = (opcode2 == 5'h0d);
+                    (opcode2 == 5'h11) || (opcode2 == 5'h12));
+    wire is_fpu2  = opcode2_known && (opcode2 >= 5'h14 && opcode2 <= 5'h17);
+    wire is_load2 = opcode2_known && (opcode2 == 5'h10);
+    wire is_store2= opcode2_known && (opcode2 == 5'h13);
+    wire is_halt2 = opcode2_known && (opcode2 == 5'h0f);
+    wire is_branch2 = opcode2_known && (opcode2 >= 5'h08 && opcode2 <= 5'h0e) && (opcode2 != 5'h0d);
+    wire is_call2 = opcode2_known && (opcode2 == 5'h0c);
+    wire is_return2 = opcode2_known && (opcode2 == 5'h0d);
 
     // Store-only: stores don't write a register destination
     wire is_store1_only = is_store1 && !is_call1;
@@ -284,8 +295,8 @@ module tinker_core(
     // Branches (including CALL and RETURN) do not write a destination register.
     wire is_branch_no_write1 = is_branch1;
     wire is_branch_no_write2 = is_branch2;
-    wire alloc_preg1 = fu_out_valid1 && !is_halt1 && !is_store1_only && !is_branch_no_write1 && !is_return1;
-    wire alloc_preg2 = fu_out_valid2 && !is_halt2 && !is_store2_only && !is_branch_no_write2 && !is_return2;
+    wire alloc_preg1 = instr_valid1 && !is_halt1 && !is_store1_only && !is_branch_no_write1 && !is_return1;
+    wire alloc_preg2 = instr_valid2 && !is_halt2 && !is_store2_only && !is_branch_no_write2 && !is_return2;
 
     // Determine which arch register to read for each source
     // src1 mapping for instruction 1
@@ -416,16 +427,22 @@ module tinker_core(
     wire slot2_singleq_conflict =
         ((is_load1 || is_return1) && (is_load2 || is_return2)) ||
         ((is_store1_only || is_call1) && (is_store2_only || is_call2));
-    wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 && (is_branch1 || is_return1 || is_branch2 || is_return2);
-    wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
+    wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 && (is_branch1 || is_return1);
+    // Block dispatch when a branch/return is about to dispatch but the ROB already
+    // has an unresolved branch.  This limits speculation to one branch at a time,
+    // preventing snapshot-ID overflow and corrupted RAT restores.
+    wire slot1_branch_stall = instr_valid1 && (is_branch1 || is_return1) && rob_has_unresolved_branch;
+    wire slot2_branch_stall = instr_valid2 && (is_branch2 || is_return2) && rob_has_unresolved_branch;
+    wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict || slot2_branch_stall;
 
     assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 ||
                         hlt || rob_halt_committed ||
-                        (fu_out_valid1 && target_full1);
+                        (fu_out_valid1 && target_full1) ||
+                        slot1_branch_stall;
 
     // Valid dispatch signals
-    wire dispatch_valid1 = fu_out_valid1 && !decode_stall && !flush;
-    wire dispatch_valid2 = fu_out_valid2 && !decode_stall && !flush && !slot2_blocked;
+    wire dispatch_valid1 = instr_valid1 && !decode_stall && !flush;
+    wire dispatch_valid2 = instr_valid2 && !decode_stall && !flush && !slot2_blocked;
 
     // ================================================================
     // RS dispatch signals (directly wired based on opcode and RR)
@@ -670,9 +687,19 @@ module tinker_core(
         (opcode1 == 5'h09) ? (fu_out_pc1 + src1_val1) :
         (opcode1 == 5'h0a) ? (fu_out_pc1 + imm1) :
                               src1_val1;
+    wire branch2_target_ready =
+        (opcode2 == 5'h0a) ? 1'b1 :
+        (opcode2 == 5'h08 || opcode2 == 5'h09 || opcode2 == 5'h0b ||
+         opcode2 == 5'h0c || opcode2 == 5'h0e) ? src1_rdy2 :
+        1'b0;
+    wire [63:0] branch2_pred_target =
+        (opcode2 == 5'h09) ? (fu_out_pc2 + src1_val2) :
+        (opcode2 == 5'h0a) ? (fu_out_pc2 + imm2) :
+                              src1_val2;
     wire branch_pred1 = dispatch_valid1 && is_branch1 && branch1_target_ready;
-    wire branch_pred2 = 1'b0;
-    wire pred_redirect = branch_pred1;
+    wire branch_pred2 = dispatch_valid2 && is_branch2 && branch2_target_ready;
+    wire pred_redirect = branch_pred1 || branch_pred2;
+    wire [63:0] pred_redirect_target = branch_pred1 ? branch1_pred_target : branch2_pred_target;
 
     // ================================================================
     // Snapshot ID management for branch RAT checkpoints
@@ -693,9 +720,11 @@ module tinker_core(
             snap_id_counter <= 2'd0;
             hlt <= 1'b0;
         end else if (flush) begin
-            // On flush, keep RR state (or reset - doesn't matter much)
+            // On flush, reset RR state and restore snap_id_counter so the next
+            // branch dispatched gets a fresh snapshot ID after the restored one.
             alu_rr <= 1'b0;
             fpu_rr <= 1'b0;
+            snap_id_counter <= rob_mispredict_snap_id + 2'd1;
         end else begin
             if (rob_halt_committed)
                 hlt <= 1'b1;
@@ -760,7 +789,7 @@ module tinker_core(
         .flush(flush || pipe_kill),
         .redirect_pc(rob_mispredict_target),
         .pred_redirect(pred_redirect),
-        .pred_redirect_pc(branch1_pred_target)
+        .pred_redirect_pc(pred_redirect_target)
     );
 
     // --- Instruction Decoders ---
@@ -962,7 +991,9 @@ module tinker_core(
         .issue_pc(rs_alu0_issue_pc),
         .issue_ack(rs_alu0_issue_valid && alu0_issue_ready),
         .full(rs_alu0_full),
-        .flush(flush || pipe_kill)
+        .flush(flush || pipe_kill),
+        .flush_rob_idx(rob_mispredict_rob_idx),
+        .flush_tail(rob_mispredict_tail)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_alu1(
@@ -993,7 +1024,9 @@ module tinker_core(
         .issue_pc(rs_alu1_issue_pc),
         .issue_ack(rs_alu1_issue_valid && alu1_issue_ready),
         .full(rs_alu1_full),
-        .flush(flush || pipe_kill)
+        .flush(flush || pipe_kill),
+        .flush_rob_idx(rob_mispredict_rob_idx),
+        .flush_tail(rob_mispredict_tail)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_fpu0(
@@ -1024,7 +1057,9 @@ module tinker_core(
         .issue_pc(rs_fpu0_issue_pc),
         .issue_ack(rs_fpu0_issue_valid && fpu0_issue_ready),
         .full(rs_fpu0_full),
-        .flush(flush || pipe_kill)
+        .flush(flush || pipe_kill),
+        .flush_rob_idx(rob_mispredict_rob_idx),
+        .flush_tail(rob_mispredict_tail)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_fpu1(
@@ -1055,7 +1090,9 @@ module tinker_core(
         .issue_pc(rs_fpu1_issue_pc),
         .issue_ack(rs_fpu1_issue_valid && fpu1_issue_ready),
         .full(rs_fpu1_full),
-        .flush(flush || pipe_kill)
+        .flush(flush || pipe_kill),
+        .flush_rob_idx(rob_mispredict_rob_idx),
+        .flush_tail(rob_mispredict_tail)
     );
 
     // --- ALU Pipes ---
@@ -1079,7 +1116,9 @@ module tinker_core(
         .br_target(alu0_br_target),
         .br_rob_idx_out(alu0_br_rob_idx),
         .cdb_stall(cdb_alu0_stall),
-        .flush(flush || pipe_kill)
+        .flush(flush || pipe_kill),
+        .flush_rob_idx(rob_mispredict_rob_idx),
+        .flush_tail(rob_mispredict_tail)
     );
 
     alu_pipe alu_pipe1(
@@ -1102,7 +1141,9 @@ module tinker_core(
         .br_target(alu1_br_target),
         .br_rob_idx_out(alu1_br_rob_idx),
         .cdb_stall(cdb_alu1_stall),
-        .flush(flush || pipe_kill)
+        .flush(flush || pipe_kill),
+        .flush_rob_idx(rob_mispredict_rob_idx),
+        .flush_tail(rob_mispredict_tail)
     );
 
     // --- FPU (wrapper containing both FPU pipes) ---
@@ -1132,7 +1173,9 @@ module tinker_core(
         .pipe1_cdb_rob_idx(fpu1_cdb_rob),
         .pipe0_cdb_stall(cdb_fpu0_stall),
         .pipe1_cdb_stall(cdb_fpu1_stall),
-        .flush(flush || pipe_kill)
+        .flush(flush || pipe_kill),
+        .flush_rob_idx(rob_mispredict_rob_idx),
+        .flush_tail(rob_mispredict_tail)
     );
 
     // --- Load Queue ---
@@ -1223,7 +1266,7 @@ module tinker_core(
         .alloc_new_phys2(alloc_preg2 ? new_phys_rd2 : 7'd0),
         .alloc_pc2(fu_out_pc2),
         .alloc_branch_pred2(branch_pred2),
-        .alloc_branch_target2(64'd0),
+        .alloc_branch_target2(branch2_pred_target),
         .alloc_snap_id2(snap_id2),
         .alloc_idx2(rob_alloc_idx2),
         .cdb0_valid(cdb0_valid),
@@ -1788,8 +1831,22 @@ module reservation_station #(
 
     // Status
     output full,
-    input flush
+    input flush,
+    input [4:0] flush_rob_idx,
+    input [4:0] flush_tail
 );
+
+    // Selective flush helper: true if entry is younger than mispredicted branch
+    function automatic is_squashed;
+        input [4:0] idx;
+        reg [4:0] offset_idx;
+        reg [4:0] offset_tail;
+        begin
+            offset_idx = idx - flush_rob_idx - 5'd1;
+            offset_tail = flush_tail - flush_rob_idx - 5'd1;
+            is_squashed = (offset_idx < offset_tail);
+        end
+    endfunction
 
     // Entry storage
     reg valid [0:NUM_ENTRIES-1];
@@ -1907,7 +1964,7 @@ module reservation_station #(
     // Sequential logic
     integer i;
     always @(posedge clk or posedge rst) begin
-        if (rst || flush) begin
+        if (rst) begin
             for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
                 valid[i] <= 0;
                 src1_rdy[i] <= 0;
@@ -1916,6 +1973,13 @@ module reservation_station #(
             end
             age_counter <= 0;
         end else begin
+            // Selective flush: only squash entries younger than mispredicted branch
+            if (flush) begin
+                for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
+                    if (valid[i] && is_squashed(rob_idx[i]))
+                        valid[i] <= 0;
+                end
+            end
             // CDB snoop: update pending sources
             for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
                 if (valid[i]) begin
@@ -2006,8 +2070,22 @@ module alu_pipe(
     output reg [4:0] br_rob_idx_out,
 
     input cdb_stall,
-    input flush
+    input flush,
+    input [4:0] flush_rob_idx,
+    input [4:0] flush_tail
 );
+
+    // Selective flush helper: true if entry is younger than mispredicted branch
+    function automatic is_squashed;
+        input [4:0] idx;
+        reg [4:0] offset_idx;
+        reg [4:0] offset_tail;
+        begin
+            offset_idx = idx - flush_rob_idx - 5'd1;
+            offset_tail = flush_tail - flush_rob_idx - 5'd1;
+            is_squashed = (offset_idx < offset_tail);
+        end
+    endfunction
 
     // ========================================================================
     // Operation category encoding (decoded in stage 1)
@@ -2209,7 +2287,8 @@ module alu_pipe(
     end
 
     // Stage 1 advances every cycle, so the pipe can accept a new op each cycle.
-    assign issue_ready = !cdb_stall || flush;
+    // Don't accept during flush - selective squash may leave s1 occupied.
+    assign issue_ready = !cdb_stall && !flush;
 
     // ========================================================================
     // Stage 2 combinational logic: Execute / Result Generation
@@ -2279,9 +2358,17 @@ module alu_pipe(
     // Pipeline register updates
     // ========================================================================
     always @(posedge clk or posedge rst) begin
-        if (rst || flush) begin
+        if (rst) begin
             s1_valid    <= 1'b0;
             cdb_valid   <= 1'b0;
+            br_resolved <= 1'b0;
+        end else if (flush) begin
+            // Selective flush: only squash stages younger than mispredicted branch
+            if (s1_valid && is_squashed(s1_rob_idx))
+                s1_valid <= 1'b0;
+            if (cdb_valid && is_squashed(cdb_rob_idx))
+                cdb_valid <= 1'b0;
+            // Always clear br_resolved on flush to prevent re-resolution
             br_resolved <= 1'b0;
         end else if (cdb_stall) begin
             // Hold all pipeline state when CDB is stalled - don't advance pipeline
@@ -2342,8 +2429,22 @@ module fpu_pipe(
     output reg [4:0] cdb_rob_idx,
 
     input cdb_stall,
-    input flush
+    input flush,
+    input [4:0] flush_rob_idx,
+    input [4:0] flush_tail
 );
+
+    function automatic is_squashed;
+        input [4:0] idx;
+        reg [4:0] offset_idx;
+        reg [4:0] offset_tail;
+        begin
+            offset_idx = idx - flush_rob_idx - 5'd1;
+            offset_tail = flush_tail - flush_rob_idx - 5'd1;
+            is_squashed = (offset_idx < offset_tail);
+        end
+    endfunction
+
     reg s1_valid, s2_valid, s3_valid, s4_valid, s5_valid;
     reg [4:0]  s1_opcode;
     reg [63:0] s1_src1, s1_src2;
@@ -2373,16 +2474,24 @@ module fpu_pipe(
         endcase
     end
 
-    assign issue_ready = !cdb_stall || flush;
+    assign issue_ready = !cdb_stall && !flush;
 
     always @(posedge clk or posedge rst) begin
-        if (rst || flush) begin
+        if (rst) begin
             s1_valid  <= 1'b0;
             s2_valid  <= 1'b0;
             s3_valid  <= 1'b0;
             s4_valid  <= 1'b0;
             s5_valid  <= 1'b0;
             cdb_valid <= 1'b0;
+        end else if (flush) begin
+            // Selective flush: only squash stages younger than mispredicted branch
+            if (s1_valid && is_squashed(s1_rob_idx)) s1_valid <= 1'b0;
+            if (s2_valid && is_squashed(s2_rob_idx)) s2_valid <= 1'b0;
+            if (s3_valid && is_squashed(s3_rob_idx)) s3_valid <= 1'b0;
+            if (s4_valid && is_squashed(s4_rob_idx)) s4_valid <= 1'b0;
+            if (s5_valid && is_squashed(s5_rob_idx)) s5_valid <= 1'b0;
+            if (cdb_valid && is_squashed(cdb_rob_idx)) cdb_valid <= 1'b0;
         end else if (cdb_stall) begin
             // Hold the entire pipe when the CDB can't accept a result.
         end else begin
@@ -2459,7 +2568,9 @@ module fpu_unit(
 
     input pipe0_cdb_stall,
     input pipe1_cdb_stall,
-    input flush
+    input flush,
+    input [4:0] flush_rob_idx,
+    input [4:0] flush_tail
 );
 
     fpu_pipe fpu_pipe0(
@@ -2476,7 +2587,9 @@ module fpu_unit(
         .cdb_value(pipe0_cdb_value),
         .cdb_rob_idx(pipe0_cdb_rob_idx),
         .cdb_stall(pipe0_cdb_stall),
-        .flush(flush)
+        .flush(flush),
+        .flush_rob_idx(flush_rob_idx),
+        .flush_tail(flush_tail)
     );
 
     fpu_pipe fpu_pipe1(
@@ -2493,7 +2606,9 @@ module fpu_unit(
         .cdb_value(pipe1_cdb_value),
         .cdb_rob_idx(pipe1_cdb_rob_idx),
         .cdb_stall(pipe1_cdb_stall),
-        .flush(flush)
+        .flush(flush),
+        .flush_rob_idx(flush_rob_idx),
+        .flush_tail(flush_tail)
     );
 
 endmodule
