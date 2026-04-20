@@ -50,6 +50,7 @@ module tinker_core(
     wire        rob_mispredict, rob_flush_all;
     wire [63:0] rob_mispredict_target;
     wire [4:0]  rob_mispredict_rob_idx;
+    wire [4:0]  rob_mispredict_tail;
     wire [1:0]  rob_mispredict_snap_id;
     wire        rob_has_unresolved_branch;
     wire        rob_commit_en1, rob_commit_en2;
@@ -418,7 +419,7 @@ module tinker_core(
     wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 && (is_branch1 || is_return1 || is_branch2 || is_return2);
     wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
 
-    assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 || rob_has_unresolved_branch ||
+    assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 ||
                         hlt || rob_halt_committed ||
                         (fu_out_valid1 && target_full1);
 
@@ -961,7 +962,7 @@ module tinker_core(
         .issue_pc(rs_alu0_issue_pc),
         .issue_ack(rs_alu0_issue_valid && alu0_issue_ready),
         .full(rs_alu0_full),
-        .flush(pipe_kill)
+        .flush(flush || pipe_kill)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_alu1(
@@ -992,7 +993,7 @@ module tinker_core(
         .issue_pc(rs_alu1_issue_pc),
         .issue_ack(rs_alu1_issue_valid && alu1_issue_ready),
         .full(rs_alu1_full),
-        .flush(pipe_kill)
+        .flush(flush || pipe_kill)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_fpu0(
@@ -1023,7 +1024,7 @@ module tinker_core(
         .issue_pc(rs_fpu0_issue_pc),
         .issue_ack(rs_fpu0_issue_valid && fpu0_issue_ready),
         .full(rs_fpu0_full),
-        .flush(pipe_kill)
+        .flush(flush || pipe_kill)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_fpu1(
@@ -1054,7 +1055,7 @@ module tinker_core(
         .issue_pc(rs_fpu1_issue_pc),
         .issue_ack(rs_fpu1_issue_valid && fpu1_issue_ready),
         .full(rs_fpu1_full),
-        .flush(pipe_kill)
+        .flush(flush || pipe_kill)
     );
 
     // --- ALU Pipes ---
@@ -1078,7 +1079,7 @@ module tinker_core(
         .br_target(alu0_br_target),
         .br_rob_idx_out(alu0_br_rob_idx),
         .cdb_stall(cdb_alu0_stall),
-        .flush(pipe_kill)
+        .flush(flush || pipe_kill)
     );
 
     alu_pipe alu_pipe1(
@@ -1101,7 +1102,7 @@ module tinker_core(
         .br_target(alu1_br_target),
         .br_rob_idx_out(alu1_br_rob_idx),
         .cdb_stall(cdb_alu1_stall),
-        .flush(pipe_kill)
+        .flush(flush || pipe_kill)
     );
 
     // --- FPU (wrapper containing both FPU pipes) ---
@@ -1131,7 +1132,7 @@ module tinker_core(
         .pipe1_cdb_rob_idx(fpu1_cdb_rob),
         .pipe0_cdb_stall(cdb_fpu0_stall),
         .pipe1_cdb_stall(cdb_fpu1_stall),
-        .flush(pipe_kill)
+        .flush(flush || pipe_kill)
     );
 
     // --- Load Queue ---
@@ -1244,6 +1245,7 @@ module tinker_core(
         .mispredict(rob_mispredict),
         .mispredict_target(rob_mispredict_target),
         .mispredict_rob_idx(rob_mispredict_rob_idx),
+        .mispredict_tail(rob_mispredict_tail),
         .mispredict_snap_id(rob_mispredict_snap_id),
         .flush_all(rob_flush_all),
         .has_unresolved_branch(rob_has_unresolved_branch),
@@ -1277,25 +1279,46 @@ module tinker_core(
         end
     end
 
+    function automatic logic rob_idx_after(input [4:0] idx, input [4:0] ref_idx, input [4:0] tail_idx);
+        logic [4:0] offset_idx;
+        logic [4:0] offset_tail;
+        begin
+            offset_idx = idx - ref_idx - 5'd1;
+            offset_tail = tail_idx - ref_idx - 5'd1;
+            rob_idx_after = (offset_idx < offset_tail);
+        end
+    endfunction
+
+    wire alu0_cdb_valid_masked = alu0_cdb_valid &&
+        !(flush && rob_idx_after(alu0_cdb_rob, rob_mispredict_rob_idx, rob_mispredict_tail));
+    wire alu1_cdb_valid_masked = alu1_cdb_valid &&
+        !(flush && rob_idx_after(alu1_cdb_rob, rob_mispredict_rob_idx, rob_mispredict_tail));
+    wire fpu0_cdb_valid_masked = fpu0_cdb_valid &&
+        !(flush && rob_idx_after(fpu0_cdb_rob, rob_mispredict_rob_idx, rob_mispredict_tail));
+    wire fpu1_cdb_valid_masked = fpu1_cdb_valid &&
+        !(flush && rob_idx_after(fpu1_cdb_rob, rob_mispredict_rob_idx, rob_mispredict_tail));
+    wire lq_cdb_valid_masked = lq_cdb_valid &&
+        !(flush && rob_idx_after(lq_cdb_rob, rob_mispredict_rob_idx, rob_mispredict_tail));
+
     // --- CDB Arbiter ---
     cdb_arbiter cdb_arb(
-        .alu0_valid(alu0_cdb_valid),
+        .alu0_valid(alu0_cdb_valid_masked),
         .alu0_tag(alu0_cdb_tag),
         .alu0_value(alu0_cdb_value),
         .alu0_rob(alu0_cdb_rob),
-        .fpu0_valid(fpu0_cdb_valid),
+        .fpu0_valid(fpu0_cdb_valid_masked),
         .fpu0_tag(fpu0_cdb_tag),
         .fpu0_value(fpu0_cdb_value),
         .fpu0_rob(fpu0_cdb_rob),
-        .lsu0_valid(lq_cdb_valid),
+        .lsu0_valid(lq_cdb_valid_masked),
         .lsu0_tag(lq_cdb_tag),
         .lsu0_value(lq_cdb_value),
         .lsu0_rob(lq_cdb_rob),
-        .alu1_valid(alu1_cdb_valid),
+        .alu1_valid(alu1_cdb_valid_masked),
         .alu1_tag(alu1_cdb_tag),
         .alu1_value(alu1_cdb_value),
         .alu1_rob(alu1_cdb_rob),
-        .fpu1_valid(fpu1_cdb_valid),
+        .fpu1_valid(fpu1_cdb_valid_masked),
         .fpu1_tag(fpu1_cdb_tag),
         .fpu1_value(fpu1_cdb_value),
         .fpu1_rob(fpu1_cdb_rob),
@@ -3031,6 +3054,7 @@ module rob(
     output reg         mispredict,
     output reg  [63:0] mispredict_target,
     output reg  [4:0]  mispredict_rob_idx,
+    output reg  [4:0]  mispredict_tail,
     output reg  [1:0]  mispredict_snap_id,
     output reg         flush_all,
 
@@ -3127,6 +3151,7 @@ module rob(
             flush_all <= 0;
             mispredict_target <= 0;
             mispredict_rob_idx <= 0;
+            mispredict_tail <= 0;
             mispredict_snap_id <= 0;
             commit_en1 <= 0;
             commit_en2 <= 0;
@@ -3191,6 +3216,7 @@ module rob(
                      (branch_target_pred[br_rob_idx] != br_target))) begin
                     mispredict <= 1;
                     mispredict_rob_idx <= br_rob_idx;
+                    mispredict_tail <= tail;
                     mispredict_snap_id <= snap_id[br_rob_idx];
                     flush_all <= 1;
                     this_cycle_flush = 1;
