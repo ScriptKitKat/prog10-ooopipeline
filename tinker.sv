@@ -449,22 +449,15 @@ module tinker_core(
     // owning ROB index so out-of-order branch resolution cannot overwrite a live checkpoint.
     reg [3:0] snap_in_use;
     reg [4:0] snap_owner_rob [0:3];
-    wire [3:0] snap_free_mask_resolve = br_resolved_combined ? {
-        (snap_in_use[3] && snap_owner_rob[3] == br_rob_idx_combined),
-        (snap_in_use[2] && snap_owner_rob[2] == br_rob_idx_combined),
-        (snap_in_use[1] && snap_owner_rob[1] == br_rob_idx_combined),
-        (snap_in_use[0] && snap_owner_rob[0] == br_rob_idx_combined)
-    } : 4'b0;
-    wire [3:0] snap_in_use_effective = snap_in_use & ~snap_free_mask_resolve;
-    wire [1:0] snap_pick_id1 = !snap_in_use_effective[0] ? 2'd0 :
-                               !snap_in_use_effective[1] ? 2'd1 :
-                               !snap_in_use_effective[2] ? 2'd2 : 2'd3;
-    wire branch_snapshot_pool_full = &snap_in_use_effective;
+    wire [1:0] snap_pick_id1 = !snap_in_use[0] ? 2'd0 :
+                               !snap_in_use[1] ? 2'd1 :
+                               !snap_in_use[2] ? 2'd2 : 2'd3;
+    wire branch_snapshot_pool_full = &snap_in_use;
     wire block_slot1_for_branch = branch_snapshot_pool_full && slot1_wants_branch;
     wire slot1_branch_will_dispatch = slot1_wants_branch && !decode_stall && !flush && !block_slot1_for_branch;
     wire [3:0] snap_in_use_after_slot1_est = slot1_branch_will_dispatch ?
-                                             (snap_in_use_effective | (4'b0001 << snap_pick_id1)) :
-                                             snap_in_use_effective;
+                                             (snap_in_use | (4'b0001 << snap_pick_id1)) :
+                                             snap_in_use;
     wire block_slot2_for_branch = (&snap_in_use_after_slot1_est) && slot2_wants_branch;
 
     // Valid dispatch signals
@@ -724,8 +717,8 @@ module tinker_core(
     wire take_snap1 = dispatch_valid1 && (is_branch1 || is_return1);
     wire take_snap2 = dispatch_valid2 && (is_branch2 || is_return2);
     wire [3:0] snap_in_use_after_slot1 = take_snap1 ?
-                                         (snap_in_use_effective | (4'b0001 << snap_id1)) :
-                                         snap_in_use_effective;
+                                         (snap_in_use | (4'b0001 << snap_id1)) :
+                                         snap_in_use;
     wire [1:0] snap_id2 = !snap_in_use_after_slot1[0] ? 2'd0 :
                           !snap_in_use_after_slot1[1] ? 2'd1 :
                           !snap_in_use_after_slot1[2] ? 2'd2 : 2'd3;
