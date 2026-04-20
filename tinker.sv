@@ -657,11 +657,21 @@ module tinker_core(
                            is_halt2   ? ITYPE_HALT :
                            ITYPE_ALU;
 
-    // The current fetch unit always fetches sequentially and only redirects after resolution.
-    // Until the frontend actually speculates, the ROB's recorded prediction must remain
-    // "not taken" so recovery matches what fetch really did.
-    wire branch_pred1 = 1'b0;
+    // Predict common control-flow branches as taken when their target is known at dispatch.
+    // Decode still allows only one unresolved branch at a time, so this is frontend-only
+    // speculation: it fills the fetch buffer from the likely target while the branch resolves.
+    wire branch1_target_ready =
+        (opcode1 == 5'h0a) ? 1'b1 :
+        (opcode1 == 5'h08 || opcode1 == 5'h09 || opcode1 == 5'h0b ||
+         opcode1 == 5'h0c || opcode1 == 5'h0e) ? src1_rdy1 :
+        1'b0;
+    wire [63:0] branch1_pred_target =
+        (opcode1 == 5'h09) ? (fu_out_pc1 + src1_val1) :
+        (opcode1 == 5'h0a) ? (fu_out_pc1 + imm1) :
+                              src1_val1;
+    wire branch_pred1 = dispatch_valid1 && is_branch1 && branch1_target_ready;
     wire branch_pred2 = 1'b0;
+    wire pred_redirect = branch_pred1;
 
     // ================================================================
     // Snapshot ID management for branch RAT checkpoints
@@ -747,7 +757,9 @@ module tinker_core(
         .decode_stall(decode_stall),
         .consume_two(dispatch_valid2),
         .flush(flush || pipe_kill),
-        .redirect_pc(rob_mispredict_target)
+        .redirect_pc(rob_mispredict_target),
+        .pred_redirect(pred_redirect),
+        .pred_redirect_pc(branch1_pred_target)
     );
 
     // --- Instruction Decoders ---
@@ -1200,7 +1212,7 @@ module tinker_core(
         .alloc_new_phys1(alloc_preg1 ? new_phys_rd1 : 7'd0),
         .alloc_pc1(fu_out_pc1),
         .alloc_branch_pred1(branch_pred1),
-        .alloc_branch_target1(64'd0),  // predict not-taken, target=0
+        .alloc_branch_target1(branch1_pred_target),
         .alloc_snap_id1(snap_id1),
         .alloc_idx1(rob_alloc_idx1),
         .alloc_en2(dispatch_valid2),
@@ -3395,7 +3407,9 @@ module fetch_unit(
 
     // Flush / redirect
     input  wire        flush,
-    input  wire [63:0] redirect_pc
+    input  wire [63:0] redirect_pc,
+    input  wire        pred_redirect,
+    input  wire [63:0] pred_redirect_pc
 );
 
     // Fetch buffer: 16-entry circular buffer, each entry = {pc(64), instruction(32)}
@@ -3444,6 +3458,11 @@ module fetch_unit(
             fb_count <= 0;
         end else if (flush) begin
             pc_reg <= redirect_pc;
+            fb_head <= 0;
+            fb_tail <= 0;
+            fb_count <= 0;
+        end else if (pred_redirect) begin
+            pc_reg <= pred_redirect_pc;
             fb_head <= 0;
             fb_tail <= 0;
             fb_count <= 0;
