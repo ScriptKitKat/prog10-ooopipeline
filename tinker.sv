@@ -745,7 +745,7 @@ module tinker_core(
             // On flush, keep RR state (or reset - doesn't matter much)
             alu_rr <= 1'b0;
             fpu_rr <= 1'b0;
-            post_flush_stall <= 3'd6;
+            post_flush_stall <= 3'd5;
             // If a previously deferred branch is being serviced this cycle, free its
             // checkpoint slot even though flush bypasses the normal resolved-branch path.
             if (br_resolved_combined) begin
