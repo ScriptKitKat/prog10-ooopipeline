@@ -843,7 +843,7 @@ module tinker_core(
     // src2 phys tags from rat_extra port3/4, with intra-dep override
     assign ren_phys_src2_1_final = is_store1_only ? rat_read_preg2 :  // store data from primary port2
                                    rat_extra_preg3;                    // src2 from extra port3
-    assign ren_phys_src2_2_final = is_store2_only ? rat_read_preg4 :
+    assign ren_phys_src2_2_final = is_store2_only ? ren_phys_src2_2 :
                                    (alloc_preg1 && src2_areg2 == dest_areg1) ? new_phys_rd1 :
                                    rat_extra_preg4;
 
