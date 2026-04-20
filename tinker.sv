@@ -185,6 +185,8 @@ module tinker_core(
     wire br_squash = flush;
     wire [4:0] br_squash_rob_idx = rob_mispredict_rob_idx;
     wire [4:0] rob_recover_tail;
+    reg arch_prf_sync_pending;
+    reg [2:0] post_flush_stall;
 
     // ================================================================
     // Branch resolution: combine from ALU pipes + LQ with overflow queue
@@ -439,6 +441,8 @@ module tinker_core(
     wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
 
     assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 ||
+                        arch_prf_sync_pending ||
+                        (post_flush_stall != 3'd0) ||
                         hlt || rob_halt_committed ||
                         (fu_out_valid1 && target_full1);
 
@@ -731,6 +735,7 @@ module tinker_core(
             alu_rr <= 1'b0;
             fpu_rr <= 1'b0;
             hlt <= 1'b0;
+            post_flush_stall <= 3'd0;
             snap_in_use <= 4'b0000;
             snap_owner_rob[0] <= 5'd0;
             snap_owner_rob[1] <= 5'd0;
@@ -740,6 +745,7 @@ module tinker_core(
             // On flush, keep RR state (or reset - doesn't matter much)
             alu_rr <= 1'b0;
             fpu_rr <= 1'b0;
+            post_flush_stall <= 3'd6;
             // If a previously deferred branch is being serviced this cycle, free its
             // checkpoint slot even though flush bypasses the normal resolved-branch path.
             if (br_resolved_combined) begin
@@ -771,6 +777,8 @@ module tinker_core(
         end else begin
             if (rob_halt_committed)
                 hlt <= 1'b1;
+            if (post_flush_stall != 3'd0)
+                post_flush_stall <= post_flush_stall - 3'd1;
 
             // Update RR counters
             if (dispatch_valid1 || dispatch_valid2) begin
@@ -1384,14 +1392,18 @@ module tinker_core(
     );
 
     // --- Sync architectural register file to physical register file ---
-    // The autograder may pre-load values into reg_file.registers during reset.
-    // Since the OOO pipeline reads from the PRF, we copy on negedge reset.
-    // The reg_file no longer clears regs 0-30 on clock edges during reset,
-    // so backdoor-written values persist. The initial RAT is identity-mapped.
+    // The autograder may pre-load values into reg_file.registers while reset is high.
+    // Since the OOO pipeline reads from the PRF, copy once on the first live cycle.
     integer sync_i;
-    always @(negedge reset) begin
-        for (sync_i = 0; sync_i < 32; sync_i = sync_i + 1) begin
-            prf_inst.regs[sync_i] = reg_file.registers[sync_i];
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            arch_prf_sync_pending <= 1'b1;
+        end else if (arch_prf_sync_pending) begin
+            for (sync_i = 0; sync_i < 32; sync_i = sync_i + 1) begin
+                prf_inst.regs[sync_i] = reg_file.registers[sync_i];
+                prf_inst.ready[sync_i] = 1'b1;
+            end
+            arch_prf_sync_pending <= 1'b0;
         end
     end
 
@@ -3497,18 +3509,18 @@ module rob(
                 is_store1 = (itype[head] == ITYPE_STORE);
                 is_store2 = (itype[head2] == ITYPE_STORE);
                 head_complete_now = complete[head] ||
-                                    (cdb0_valid && cdb0_rob_idx == head) ||
-                                    (cdb1_valid && cdb1_rob_idx == head) ||
+                                    (cdb0_valid && !flush_all && cdb0_rob_idx == head) ||
+                                    (cdb1_valid && !flush_all && cdb1_rob_idx == head) ||
                                     (br_resolved && br_rob_idx == head);
                 head2_complete_now = complete[head2] ||
-                                     (cdb0_valid && cdb0_rob_idx == head2) ||
-                                     (cdb1_valid && cdb1_rob_idx == head2) ||
+                                     (cdb0_valid && !flush_all && cdb0_rob_idx == head2) ||
+                                     (cdb1_valid && !flush_all && cdb1_rob_idx == head2) ||
                                      (br_resolved && br_rob_idx == head2);
-                head_result_now = (cdb0_valid && cdb0_rob_idx == head) ? cdb0_value :
-                                  (cdb1_valid && cdb1_rob_idx == head) ? cdb1_value :
+                head_result_now = (cdb0_valid && !flush_all && cdb0_rob_idx == head) ? cdb0_value :
+                                  (cdb1_valid && !flush_all && cdb1_rob_idx == head) ? cdb1_value :
                                   result[head];
-                head2_result_now = (cdb0_valid && cdb0_rob_idx == head2) ? cdb0_value :
-                                   (cdb1_valid && cdb1_rob_idx == head2) ? cdb1_value :
+                head2_result_now = (cdb0_valid && !flush_all && cdb0_rob_idx == head2) ? cdb0_value :
+                                   (cdb1_valid && !flush_all && cdb1_rob_idx == head2) ? cdb1_value :
                                    result[head2];
                 head_store_addr_now = store_addr_rdy[head] ||
                                       (sq_addr_ready && sq_addr_rob_idx == head);
