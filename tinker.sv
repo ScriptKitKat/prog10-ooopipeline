@@ -445,10 +445,20 @@ module tinker_core(
     wire slot1_wants_branch = fu_out_valid1 && (is_branch1 || is_return1);
     wire slot2_wants_branch = fu_out_valid2 && (is_branch2 || is_return2);
 
-    // Allow younger non-branch work to continue speculatively, but hold any younger
-    // control-flow instruction until the oldest outstanding branch resolves.
-    wire block_slot1_for_branch = rob_has_unresolved_branch && slot1_wants_branch;
-    wire block_slot2_for_branch = rob_has_unresolved_branch && slot2_wants_branch;
+    // The checkpointed RAT/free-list currently has 4 snapshot slots. Track allocation/free by
+    // owning ROB index so out-of-order branch resolution cannot overwrite a live checkpoint.
+    reg [3:0] snap_in_use;
+    reg [4:0] snap_owner_rob [0:3];
+    wire [1:0] snap_pick_id1 = !snap_in_use[0] ? 2'd0 :
+                               !snap_in_use[1] ? 2'd1 :
+                               !snap_in_use[2] ? 2'd2 : 2'd3;
+    wire branch_snapshot_pool_full = &snap_in_use;
+    wire block_slot1_for_branch = branch_snapshot_pool_full && slot1_wants_branch;
+    wire slot1_branch_will_dispatch = slot1_wants_branch && !decode_stall && !flush && !block_slot1_for_branch;
+    wire [3:0] snap_in_use_after_slot1_est = slot1_branch_will_dispatch ?
+                                             (snap_in_use | (4'b0001 << snap_pick_id1)) :
+                                             snap_in_use;
+    wire block_slot2_for_branch = (&snap_in_use_after_slot1_est) && slot2_wants_branch;
 
     // Valid dispatch signals
     wire dispatch_valid1 = fu_out_valid1 && !decode_stall && !flush && !block_slot1_for_branch;
@@ -685,8 +695,8 @@ module tinker_core(
                            ITYPE_ALU;
 
     // Predict common control-flow branches as taken when their target is known at dispatch.
-    // Decode still allows only one unresolved branch at a time, so this is frontend-only
-    // speculation: it fills the fetch buffer from the likely target while the branch resolves.
+    // Up to 4 branches can remain unresolved at once (snapshot capacity), so this prediction
+    // helps keep the frontend fed while those branches execute.
     wire branch1_target_ready =
         (opcode1 == 5'h0a) ? 1'b1 :
         (opcode1 == 5'h08 || opcode1 == 5'h09 || opcode1 == 5'h0b ||
@@ -703,11 +713,13 @@ module tinker_core(
     // ================================================================
     // Snapshot ID management for branch RAT checkpoints
     // ================================================================
-    reg [1:0] snap_id_counter;
-    wire [1:0] snap_id1 = snap_id_counter;
-    wire [1:0] snap_id2 = snap_id_counter + 2'd1;
+    wire [1:0] snap_id1 = snap_pick_id1;
     wire take_snap1 = dispatch_valid1 && (is_branch1 || is_return1);
     wire take_snap2 = dispatch_valid2 && (is_branch2 || is_return2);
+    wire [3:0] snap_in_use_after_slot1 = take_snap1 ? (snap_in_use | (4'b0001 << snap_id1)) : snap_in_use;
+    wire [1:0] snap_id2 = !snap_in_use_after_slot1[0] ? 2'd0 :
+                          !snap_in_use_after_slot1[1] ? 2'd1 :
+                          !snap_in_use_after_slot1[2] ? 2'd2 : 2'd3;
 
     // ================================================================
     // Sequential logic: RR counters, snapshot ID, halt
@@ -716,12 +728,44 @@ module tinker_core(
         if (reset) begin
             alu_rr <= 1'b0;
             fpu_rr <= 1'b0;
-            snap_id_counter <= 2'd0;
             hlt <= 1'b0;
+            snap_in_use <= 4'b0000;
+            snap_owner_rob[0] <= 5'd0;
+            snap_owner_rob[1] <= 5'd0;
+            snap_owner_rob[2] <= 5'd0;
+            snap_owner_rob[3] <= 5'd0;
         end else if (flush) begin
             // On flush, keep RR state (or reset - doesn't matter much)
             alu_rr <= 1'b0;
             fpu_rr <= 1'b0;
+            // If a previously deferred branch is being serviced this cycle, free its
+            // checkpoint slot even though flush bypasses the normal resolved-branch path.
+            if (br_resolved_combined) begin
+                if (snap_in_use[0] && snap_owner_rob[0] == br_rob_idx_combined)
+                    snap_in_use[0] <= 1'b0;
+                if (snap_in_use[1] && snap_owner_rob[1] == br_rob_idx_combined)
+                    snap_in_use[1] <= 1'b0;
+                if (snap_in_use[2] && snap_owner_rob[2] == br_rob_idx_combined)
+                    snap_in_use[2] <= 1'b0;
+                if (snap_in_use[3] && snap_owner_rob[3] == br_rob_idx_combined)
+                    snap_in_use[3] <= 1'b0;
+            end
+            if (snap_in_use[0] &&
+                (snap_owner_rob[0] == rob_mispredict_rob_idx ||
+                 is_after_in_ring(snap_owner_rob[0], rob_mispredict_rob_idx, rob_recover_tail)))
+                snap_in_use[0] <= 1'b0;
+            if (snap_in_use[1] &&
+                (snap_owner_rob[1] == rob_mispredict_rob_idx ||
+                 is_after_in_ring(snap_owner_rob[1], rob_mispredict_rob_idx, rob_recover_tail)))
+                snap_in_use[1] <= 1'b0;
+            if (snap_in_use[2] &&
+                (snap_owner_rob[2] == rob_mispredict_rob_idx ||
+                 is_after_in_ring(snap_owner_rob[2], rob_mispredict_rob_idx, rob_recover_tail)))
+                snap_in_use[2] <= 1'b0;
+            if (snap_in_use[3] &&
+                (snap_owner_rob[3] == rob_mispredict_rob_idx ||
+                 is_after_in_ring(snap_owner_rob[3], rob_mispredict_rob_idx, rob_recover_tail)))
+                snap_in_use[3] <= 1'b0;
         end else begin
             if (rob_halt_committed)
                 hlt <= 1'b1;
@@ -738,11 +782,27 @@ module tinker_core(
                     fpu_rr <= dispatch_valid1 && is_fpu1 ? fpu_rr : ~fpu_rr;
             end
 
-            // Update snapshot counter
-            if (take_snap1 && take_snap2)
-                snap_id_counter <= snap_id_counter + 2'd2;
-            else if (take_snap1 || take_snap2)
-                snap_id_counter <= snap_id_counter + 2'd1;
+            // Free snapshot slot when its owning branch resolves.
+            if (br_resolved_combined) begin
+                if (snap_in_use[0] && snap_owner_rob[0] == br_rob_idx_combined)
+                    snap_in_use[0] <= 1'b0;
+                if (snap_in_use[1] && snap_owner_rob[1] == br_rob_idx_combined)
+                    snap_in_use[1] <= 1'b0;
+                if (snap_in_use[2] && snap_owner_rob[2] == br_rob_idx_combined)
+                    snap_in_use[2] <= 1'b0;
+                if (snap_in_use[3] && snap_owner_rob[3] == br_rob_idx_combined)
+                    snap_in_use[3] <= 1'b0;
+            end
+
+            // Allocate snapshot slot for newly dispatched branch/return.
+            if (take_snap1) begin
+                snap_in_use[snap_id1] <= 1'b1;
+                snap_owner_rob[snap_id1] <= rob_alloc_idx1;
+            end
+            if (take_snap2) begin
+                snap_in_use[snap_id2] <= 1'b1;
+                snap_owner_rob[snap_id2] <= rob_alloc_idx2;
+            end
         end
     end
 
