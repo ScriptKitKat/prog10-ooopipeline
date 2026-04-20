@@ -158,12 +158,27 @@ module tinker_core(
     wire cdb_alu0_stall, cdb_fpu0_stall, cdb_lsu0_stall;
     wire cdb_alu1_stall, cdb_fpu1_stall, cdb_lsu1_stall;
 
+    // Shared ROB-ring helper for selective squash/cancel logic in tinker_core.
+    // Equivalent copies exist in submodules because Verilog function scope is module-local.
+    function automatic is_after_in_ring;
+        input [4:0] idx;
+        input [4:0] base;
+        input [4:0] tail_ptr;
+        reg [4:0] offset_idx;
+        reg [4:0] offset_tail;
+        begin
+            offset_idx = idx - base - 5'd1;
+            offset_tail = tail_ptr - base - 5'd1;
+            is_after_in_ring = (offset_idx < offset_tail);
+        end
+    endfunction
+
     // ================================================================
     // Flush signal (from ROB misprediction)
     // ================================================================
     wire flush = rob_flush_all;
-    // Branch redirects should only flush the frontend/rename state. Older in-flight backend
-    // work must survive so it can still complete and retire ahead of the branch.
+    // Branch mispredicts clear frontend/rename state; backend structures receive br_squash and
+    // selectively kill only younger wrong-path work.
     wire pipe_kill = rob_halt_committed || hlt;
 
     // Selective branch squash signals for backend structures (Model B)
@@ -423,17 +438,21 @@ module tinker_core(
     wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 && (is_branch1 || is_return1 || is_branch2 || is_return2);
     wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
 
-    // Selective branch recovery only squashes backend queues. Once a branch is unresolved, keep
-    // younger work in the fetch buffer until it resolves so wrong-path state never reaches
-    // rename/dispatch, the PRF, or execution pipelines.
     assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 ||
                         hlt || rob_halt_committed ||
-                        rob_has_unresolved_branch ||
                         (fu_out_valid1 && target_full1);
 
+    wire slot1_wants_branch = fu_out_valid1 && (is_branch1 || is_return1);
+    wire slot2_wants_branch = fu_out_valid2 && (is_branch2 || is_return2);
+
+    // Allow younger non-branch work to continue speculatively, but hold any younger
+    // control-flow instruction until the oldest outstanding branch resolves.
+    wire block_slot1_for_branch = rob_has_unresolved_branch && slot1_wants_branch;
+    wire block_slot2_for_branch = rob_has_unresolved_branch && slot2_wants_branch;
+
     // Valid dispatch signals
-    wire dispatch_valid1 = fu_out_valid1 && !decode_stall && !flush;
-    wire dispatch_valid2 = fu_out_valid2 && !decode_stall && !flush && !slot2_blocked;
+    wire dispatch_valid1 = fu_out_valid1 && !decode_stall && !flush && !block_slot1_for_branch;
+    wire dispatch_valid2 = fu_out_valid2 && !decode_stall && !flush && !slot2_blocked && !block_slot2_for_branch;
     // ================================================================
     // RS dispatch signals (directly wired based on opcode and RR)
     // ================================================================
@@ -763,6 +782,7 @@ module tinker_core(
         .out_instr2(fu_out_instr2),
         .out_pc2(fu_out_pc2),
         .decode_stall(decode_stall),
+        .consume_one(dispatch_valid1),
         .consume_two(dispatch_valid2),
         .flush(flush || pipe_kill),
         .redirect_pc(rob_mispredict_target),
@@ -1098,7 +1118,10 @@ module tinker_core(
         .br_target(alu0_br_target),
         .br_rob_idx_out(alu0_br_rob_idx),
         .cdb_stall(cdb_alu0_stall),
-        .flush(pipe_kill)
+        .flush(pipe_kill),
+        .br_squash(br_squash),
+        .br_squash_rob_idx(br_squash_rob_idx),
+        .recover_tail(rob_recover_tail)
     );
 
     alu_pipe alu_pipe1(
@@ -1121,7 +1144,10 @@ module tinker_core(
         .br_target(alu1_br_target),
         .br_rob_idx_out(alu1_br_rob_idx),
         .cdb_stall(cdb_alu1_stall),
-        .flush(pipe_kill)
+        .flush(pipe_kill),
+        .br_squash(br_squash),
+        .br_squash_rob_idx(br_squash_rob_idx),
+        .recover_tail(rob_recover_tail)
     );
 
     // --- FPU (wrapper containing both FPU pipes) ---
@@ -1151,7 +1177,10 @@ module tinker_core(
         .pipe1_cdb_rob_idx(fpu1_cdb_rob),
         .pipe0_cdb_stall(cdb_fpu0_stall),
         .pipe1_cdb_stall(cdb_fpu1_stall),
-        .flush(pipe_kill)
+        .flush(pipe_kill),
+        .br_squash(br_squash),
+        .br_squash_rob_idx(br_squash_rob_idx),
+        .recover_tail(rob_recover_tail)
     );
 
     // --- Load Queue ---
@@ -1305,12 +1334,22 @@ module tinker_core(
     end
 
     // --- CDB Arbiter ---
+    wire kill_alu0_cdb = br_squash && is_after_in_ring(alu0_cdb_rob, br_squash_rob_idx, rob_recover_tail);
+    wire kill_alu1_cdb = br_squash && is_after_in_ring(alu1_cdb_rob, br_squash_rob_idx, rob_recover_tail);
+    wire kill_fpu0_cdb = br_squash && is_after_in_ring(fpu0_cdb_rob, br_squash_rob_idx, rob_recover_tail);
+    wire kill_fpu1_cdb = br_squash && is_after_in_ring(fpu1_cdb_rob, br_squash_rob_idx, rob_recover_tail);
+
+    wire alu0_cdb_valid_masked = alu0_cdb_valid && !kill_alu0_cdb;
+    wire alu1_cdb_valid_masked = alu1_cdb_valid && !kill_alu1_cdb;
+    wire fpu0_cdb_valid_masked = fpu0_cdb_valid && !kill_fpu0_cdb;
+    wire fpu1_cdb_valid_masked = fpu1_cdb_valid && !kill_fpu1_cdb;
+
     cdb_arbiter cdb_arb(
-        .alu0_valid(alu0_cdb_valid),
+        .alu0_valid(alu0_cdb_valid_masked),
         .alu0_tag(alu0_cdb_tag),
         .alu0_value(alu0_cdb_value),
         .alu0_rob(alu0_cdb_rob),
-        .fpu0_valid(fpu0_cdb_valid),
+        .fpu0_valid(fpu0_cdb_valid_masked),
         .fpu0_tag(fpu0_cdb_tag),
         .fpu0_value(fpu0_cdb_value),
         .fpu0_rob(fpu0_cdb_rob),
@@ -1318,11 +1357,11 @@ module tinker_core(
         .lsu0_tag(lq_cdb_tag),
         .lsu0_value(lq_cdb_value),
         .lsu0_rob(lq_cdb_rob),
-        .alu1_valid(alu1_cdb_valid),
+        .alu1_valid(alu1_cdb_valid_masked),
         .alu1_tag(alu1_cdb_tag),
         .alu1_value(alu1_cdb_value),
         .alu1_rob(alu1_cdb_rob),
-        .fpu1_valid(fpu1_cdb_valid),
+        .fpu1_valid(fpu1_cdb_valid_masked),
         .fpu1_tag(fpu1_cdb_tag),
         .fpu1_value(fpu1_cdb_value),
         .fpu1_rob(fpu1_cdb_rob),
@@ -1805,13 +1844,12 @@ module reservation_station #(
         input [4:0] idx;
         input [4:0] base;
         input [4:0] tail_ptr;
+        reg [4:0] offset_idx;
+        reg [4:0] offset_tail;
         begin
-            if (base < tail_ptr)
-                is_after_in_ring = (idx > base) && (idx < tail_ptr);
-            else if (base > tail_ptr)
-                is_after_in_ring = (idx > base) || (idx < tail_ptr);
-            else
-                is_after_in_ring = 1'b0;
+            offset_idx = idx - base - 5'd1;
+            offset_tail = tail_ptr - base - 5'd1;
+            is_after_in_ring = (offset_idx < offset_tail);
         end
     endfunction
 
@@ -2038,8 +2076,23 @@ module alu_pipe(
     output reg [4:0] br_rob_idx_out,
 
     input cdb_stall,
-    input flush
+    input flush,
+    input br_squash,
+    input [4:0] br_squash_rob_idx,
+    input [4:0] recover_tail
 );
+    function automatic is_after_in_ring;
+        input [4:0] idx;
+        input [4:0] base;
+        input [4:0] tail_ptr;
+        reg [4:0] offset_idx;
+        reg [4:0] offset_tail;
+        begin
+            offset_idx = idx - base - 5'd1;
+            offset_tail = tail_ptr - base - 5'd1;
+            is_after_in_ring = (offset_idx < offset_tail);
+        end
+    endfunction
 
     // ========================================================================
     // Operation category encoding (decoded in stage 1)
@@ -2241,7 +2294,7 @@ module alu_pipe(
     end
 
     // Stage 1 advances every cycle, so the pipe can accept a new op each cycle.
-    assign issue_ready = !cdb_stall || flush;
+    assign issue_ready = (!cdb_stall || flush) && !br_squash;
 
     // ========================================================================
     // Stage 2 combinational logic: Execute / Result Generation
@@ -2315,6 +2368,13 @@ module alu_pipe(
             s1_valid    <= 1'b0;
             cdb_valid   <= 1'b0;
             br_resolved <= 1'b0;
+        end else if (br_squash) begin
+            if (is_after_in_ring(s1_rob_idx, br_squash_rob_idx, recover_tail))
+                s1_valid <= 1'b0;
+            if (is_after_in_ring(cdb_rob_idx, br_squash_rob_idx, recover_tail))
+                cdb_valid <= 1'b0;
+            if (is_after_in_ring(br_rob_idx_out, br_squash_rob_idx, recover_tail))
+                br_resolved <= 1'b0;
         end else if (cdb_stall) begin
             // Hold all pipeline state when CDB is stalled - don't advance pipeline
             // But clear br_resolved so we don't re-resolve the same branch every cycle
@@ -2374,8 +2434,23 @@ module fpu_pipe(
     output reg [4:0] cdb_rob_idx,
 
     input cdb_stall,
-    input flush
+    input flush,
+    input br_squash,
+    input [4:0] br_squash_rob_idx,
+    input [4:0] recover_tail
 );
+    function automatic is_after_in_ring;
+        input [4:0] idx;
+        input [4:0] base;
+        input [4:0] tail_ptr;
+        reg [4:0] offset_idx;
+        reg [4:0] offset_tail;
+        begin
+            offset_idx = idx - base - 5'd1;
+            offset_tail = tail_ptr - base - 5'd1;
+            is_after_in_ring = (offset_idx < offset_tail);
+        end
+    endfunction
     reg s1_valid, s2_valid, s3_valid, s4_valid, s5_valid;
     reg [4:0]  s1_opcode;
     reg [63:0] s1_src1, s1_src2;
@@ -2405,7 +2480,7 @@ module fpu_pipe(
         endcase
     end
 
-    assign issue_ready = !cdb_stall || flush;
+    assign issue_ready = (!cdb_stall || flush) && !br_squash;
 
     always @(posedge clk or posedge rst) begin
         if (rst || flush) begin
@@ -2415,6 +2490,19 @@ module fpu_pipe(
             s4_valid  <= 1'b0;
             s5_valid  <= 1'b0;
             cdb_valid <= 1'b0;
+        end else if (br_squash) begin
+            if (is_after_in_ring(s1_rob_idx, br_squash_rob_idx, recover_tail))
+                s1_valid <= 1'b0;
+            if (is_after_in_ring(s2_rob_idx, br_squash_rob_idx, recover_tail))
+                s2_valid <= 1'b0;
+            if (is_after_in_ring(s3_rob_idx, br_squash_rob_idx, recover_tail))
+                s3_valid <= 1'b0;
+            if (is_after_in_ring(s4_rob_idx, br_squash_rob_idx, recover_tail))
+                s4_valid <= 1'b0;
+            if (is_after_in_ring(s5_rob_idx, br_squash_rob_idx, recover_tail))
+                s5_valid <= 1'b0;
+            if (is_after_in_ring(cdb_rob_idx, br_squash_rob_idx, recover_tail))
+                cdb_valid <= 1'b0;
         end else if (cdb_stall) begin
             // Hold the entire pipe when the CDB can't accept a result.
         end else begin
@@ -2491,7 +2579,10 @@ module fpu_unit(
 
     input pipe0_cdb_stall,
     input pipe1_cdb_stall,
-    input flush
+    input flush,
+    input br_squash,
+    input [4:0] br_squash_rob_idx,
+    input [4:0] recover_tail
 );
 
     fpu_pipe fpu_pipe0(
@@ -2508,7 +2599,10 @@ module fpu_unit(
         .cdb_value(pipe0_cdb_value),
         .cdb_rob_idx(pipe0_cdb_rob_idx),
         .cdb_stall(pipe0_cdb_stall),
-        .flush(flush)
+        .flush(flush),
+        .br_squash(br_squash),
+        .br_squash_rob_idx(br_squash_rob_idx),
+        .recover_tail(recover_tail)
     );
 
     fpu_pipe fpu_pipe1(
@@ -2525,7 +2619,10 @@ module fpu_unit(
         .cdb_value(pipe1_cdb_value),
         .cdb_rob_idx(pipe1_cdb_rob_idx),
         .cdb_stall(pipe1_cdb_stall),
-        .flush(flush)
+        .flush(flush),
+        .br_squash(br_squash),
+        .br_squash_rob_idx(br_squash_rob_idx),
+        .recover_tail(recover_tail)
     );
 
 endmodule
@@ -2596,13 +2693,12 @@ module load_queue(
         input [4:0] idx;
         input [4:0] base;
         input [4:0] tail_ptr;
+        reg [4:0] offset_idx;
+        reg [4:0] offset_tail;
         begin
-            if (base < tail_ptr)
-                is_after_in_ring = (idx > base) && (idx < tail_ptr);
-            else if (base > tail_ptr)
-                is_after_in_ring = (idx > base) || (idx < tail_ptr);
-            else
-                is_after_in_ring = 1'b0;
+            offset_idx = idx - base - 5'd1;
+            offset_tail = tail_ptr - base - 5'd1;
+            is_after_in_ring = (offset_idx < offset_tail);
         end
     endfunction
 
@@ -2854,13 +2950,12 @@ module store_queue(
         input [4:0] idx;
         input [4:0] base;
         input [4:0] tail_ptr;
+        reg [4:0] offset_idx;
+        reg [4:0] offset_tail;
         begin
-            if (base < tail_ptr)
-                is_after_in_ring = (idx > base) && (idx < tail_ptr);
-            else if (base > tail_ptr)
-                is_after_in_ring = (idx > base) || (idx < tail_ptr);
-            else
-                is_after_in_ring = 1'b0;
+            offset_idx = idx - base - 5'd1;
+            offset_tail = tail_ptr - base - 5'd1;
+            is_after_in_ring = (offset_idx < offset_tail);
         end
     endfunction
 
@@ -3514,6 +3609,7 @@ module fetch_unit(
 
     // Backpressure
     input  wire        decode_stall,
+    input  wire        consume_one,
     input  wire        consume_two,
 
     // Flush / redirect
@@ -3550,7 +3646,7 @@ module fetch_unit(
     assign out_pc2    = fbuf[fb_head_plus1][95:32];
 
     // Drain count: how many instructions consumed this cycle
-    wire drain1 = out_valid1 && !decode_stall && !flush;
+    wire drain1 = out_valid1 && consume_one;
     wire drain2 = out_valid2 && !decode_stall && !flush && consume_two;
     wire [1:0] drain_cnt = {1'b0, drain1} + {1'b0, drain2};
 
