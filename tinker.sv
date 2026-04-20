@@ -166,6 +166,11 @@ module tinker_core(
     // work must survive so it can still complete and retire ahead of the branch.
     wire pipe_kill = rob_halt_committed || hlt;
 
+    // Selective branch squash signals for backend structures (Model B)
+    wire br_squash = flush;
+    wire [4:0] br_squash_rob_idx = rob_mispredict_rob_idx;
+    wire [4:0] rob_recover_tail;
+
     // ================================================================
     // Branch resolution: combine from ALU pipes + LQ with overflow queue
     // When multiple branches resolve simultaneously, one is deferred to next cycle
@@ -966,7 +971,10 @@ module tinker_core(
         .issue_pc(rs_alu0_issue_pc),
         .issue_ack(rs_alu0_issue_valid && alu0_issue_ready),
         .full(rs_alu0_full),
-        .flush(pipe_kill)
+        .flush(pipe_kill),
+        .br_squash(br_squash),
+        .br_squash_rob_idx(br_squash_rob_idx),
+        .recover_tail(rob_recover_tail)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_alu1(
@@ -997,7 +1005,10 @@ module tinker_core(
         .issue_pc(rs_alu1_issue_pc),
         .issue_ack(rs_alu1_issue_valid && alu1_issue_ready),
         .full(rs_alu1_full),
-        .flush(pipe_kill)
+        .flush(pipe_kill),
+        .br_squash(br_squash),
+        .br_squash_rob_idx(br_squash_rob_idx),
+        .recover_tail(rob_recover_tail)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_fpu0(
@@ -1028,7 +1039,10 @@ module tinker_core(
         .issue_pc(rs_fpu0_issue_pc),
         .issue_ack(rs_fpu0_issue_valid && fpu0_issue_ready),
         .full(rs_fpu0_full),
-        .flush(pipe_kill)
+        .flush(pipe_kill),
+        .br_squash(br_squash),
+        .br_squash_rob_idx(br_squash_rob_idx),
+        .recover_tail(rob_recover_tail)
     );
 
     reservation_station #(.NUM_ENTRIES(8)) rs_fpu1(
@@ -1059,7 +1073,10 @@ module tinker_core(
         .issue_pc(rs_fpu1_issue_pc),
         .issue_ack(rs_fpu1_issue_valid && fpu1_issue_ready),
         .full(rs_fpu1_full),
-        .flush(pipe_kill)
+        .flush(pipe_kill),
+        .br_squash(br_squash),
+        .br_squash_rob_idx(br_squash_rob_idx),
+        .recover_tail(rob_recover_tail)
     );
 
     // --- ALU Pipes ---
@@ -1167,7 +1184,10 @@ module tinker_core(
         .br_rob_idx_out(lq_br_rob_idx),
         .cdb_stall(cdb_lsu0_stall),
         .full(lq_full),
-        .flush(flush)
+        .flush(pipe_kill),
+        .br_squash(br_squash),
+        .br_squash_rob_idx(br_squash_rob_idx),
+        .recover_tail(rob_recover_tail)
     );
 
     // --- Store Queue ---
@@ -1204,7 +1224,10 @@ module tinker_core(
         .rob_store_addr_value(sq_rob_store_addr_value),
         .rob_store_ready_value(sq_rob_store_ready_value),
         .full(sq_full),
-        .flush(flush)
+        .flush(pipe_kill),
+        .br_squash(br_squash),
+        .br_squash_rob_idx(br_squash_rob_idx),
+        .recover_tail(rob_recover_tail)
     );
 
     // --- ROB ---
@@ -1267,7 +1290,8 @@ module tinker_core(
         .commit_rob_idx2(rob_commit_rob_idx2),
         .commit_value2(rob_commit_value2),
         .can_alloc2(rob_can_alloc2),
-        .halt_committed(rob_halt_committed)
+        .halt_committed(rob_halt_committed),
+        .recover_tail(rob_recover_tail)
     );
 
     // --- Sync architectural register file to physical register file ---
@@ -1770,8 +1794,28 @@ module reservation_station #(
 
     // Status
     output full,
-    input flush
+    input flush,
+
+    // Selective branch squash
+    input br_squash,
+    input [4:0] br_squash_rob_idx,
+    input [4:0] recover_tail
 );
+
+    // Ring-buffer younger-than check
+    function automatic is_after_in_ring;
+        input [4:0] idx;
+        input [4:0] base;
+        input [4:0] tail_ptr;
+        begin
+            if (base < tail_ptr)
+                is_after_in_ring = (idx > base) && (idx < tail_ptr);
+            else if (base > tail_ptr)
+                is_after_in_ring = (idx > base) || (idx < tail_ptr);
+            else
+                is_after_in_ring = 1'b0;
+        end
+    endfunction
 
     // Entry storage
     reg valid [0:NUM_ENTRIES-1];
@@ -1898,6 +1942,14 @@ module reservation_station #(
             end
             age_counter <= 0;
         end else begin
+            // Selective branch squash: kill only entries younger than the mispredicted branch
+            if (br_squash) begin
+                for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
+                    if (valid[i] && is_after_in_ring(rob_idx[i], br_squash_rob_idx, recover_tail))
+                        valid[i] <= 1'b0;
+                end
+            end
+
             // CDB snoop: update pending sources
             for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
                 if (valid[i]) begin
@@ -2531,10 +2583,30 @@ module load_queue(
 
     // Status
     output full,
-    input flush
+    input flush,
+
+    // Selective branch squash
+    input br_squash,
+    input [4:0] br_squash_rob_idx,
+    input [4:0] recover_tail
 );
 
     parameter NUM_ENTRIES = 16;
+
+    // Ring-buffer younger-than check
+    function automatic is_after_in_ring;
+        input [4:0] idx;
+        input [4:0] base;
+        input [4:0] tail_ptr;
+        begin
+            if (base < tail_ptr)
+                is_after_in_ring = (idx > base) && (idx < tail_ptr);
+            else if (base > tail_ptr)
+                is_after_in_ring = (idx > base) || (idx < tail_ptr);
+            else
+                is_after_in_ring = 1'b0;
+        end
+    endfunction
 
     reg lq_valid [0:NUM_ENTRIES-1];
     reg [63:0] lq_base_val [0:NUM_ENTRIES-1];
@@ -2652,6 +2724,14 @@ module load_queue(
             end
             age_counter <= 0;
         end else begin
+            // Selective branch squash: kill only entries younger than the mispredicted branch
+            if (br_squash) begin
+                for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
+                    if (lq_valid[i] && is_after_in_ring(lq_rob_idx[i], br_squash_rob_idx, recover_tail))
+                        lq_valid[i] <= 1'b0;
+                end
+            end
+
             // CDB snoop: update base values
             for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
                 if (lq_valid[i] && !lq_base_ready[i]) begin
@@ -2761,10 +2841,30 @@ module store_queue(
 
     // Status
     output full,
-    input flush
+    input flush,
+
+    // Selective branch squash
+    input br_squash,
+    input [4:0] br_squash_rob_idx,
+    input [4:0] recover_tail
 );
 
     parameter NUM_ENTRIES = 16;
+
+    // Ring-buffer younger-than check
+    function automatic is_after_in_ring;
+        input [4:0] idx;
+        input [4:0] base;
+        input [4:0] tail_ptr;
+        begin
+            if (base < tail_ptr)
+                is_after_in_ring = (idx > base) && (idx < tail_ptr);
+            else if (base > tail_ptr)
+                is_after_in_ring = (idx > base) || (idx < tail_ptr);
+            else
+                is_after_in_ring = 1'b0;
+        end
+    endfunction
 
     reg sq_valid [0:NUM_ENTRIES-1];
     reg [63:0] sq_addr_base_val [0:NUM_ENTRIES-1];
@@ -2862,17 +2962,18 @@ module store_queue(
             rob_store_data_ready <= 0;
             rob_store_addr_value <= 64'd0;
             rob_store_ready_value <= 64'd0;
-        end else if (flush) begin
-            // Preserve existing SQ entries across branch redirects. With only one unresolved
-            // branch allowed in flight, younger wrong-path stores are never dispatched here,
-            // and CALL's own stack-push must survive the redirect.
-            rob_store_addr_ready <= 0;
-            rob_store_data_ready <= 0;
-            rob_store_addr_value <= 64'd0;
         end else begin
             rob_store_addr_ready <= 0;
             rob_store_data_ready <= 0;
             rob_store_addr_value <= 64'd0;
+
+            // Selective branch squash: kill only entries younger than the mispredicted branch
+            if (br_squash) begin
+                for (i = 0; i < NUM_ENTRIES; i = i + 1) begin
+                    if (sq_valid[i] && is_after_in_ring(sq_rob_idx[i], br_squash_rob_idx, recover_tail))
+                        sq_valid[i] <= 1'b0;
+                end
+            end
 
             // CDB snoop: update addr base and data values
             // Use first-match priority for ROB data notification
@@ -3060,7 +3161,10 @@ module rob(
     // Status
     output wire        can_alloc2,
     output wire        has_unresolved_branch,
-    output reg         halt_committed
+    output reg         halt_committed,
+
+    // Recovery tail (old tail before truncation, for selective squash)
+    output reg  [4:0]  recover_tail
 );
 
     localparam DEPTH = 32;
@@ -3136,6 +3240,7 @@ module rob(
             commit_en1 <= 0;
             commit_en2 <= 0;
             halt_committed <= 0;
+            recover_tail <= 0;
             for (i = 0; i < DEPTH; i = i + 1) begin
                 valid[i] <= 0;
                 complete[i] <= 0;
@@ -3201,6 +3306,9 @@ module rob(
                     this_cycle_flush = 1;
                     // Redirect target: if taken, go to actual target; if not taken, pc+4
                     mispredict_target <= br_taken ? br_target : (pc[br_rob_idx] + 64'd4);
+
+                    // Save old tail for selective squash in backend structures
+                    recover_tail <= tail;
 
                     // Invalidate all entries after the mispredicted branch
                     for (i = 0; i < DEPTH; i = i + 1) begin
