@@ -418,14 +418,19 @@ module tinker_core(
     wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 && (is_branch1 || is_return1 || is_branch2 || is_return2);
     wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
 
-    assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 || rob_has_unresolved_branch ||
+    assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 ||
                         hlt || rob_halt_committed ||
                         (fu_out_valid1 && target_full1);
 
-    // Valid dispatch signals
-    wire dispatch_valid1 = fu_out_valid1 && !decode_stall && !flush;
-    wire dispatch_valid2 = fu_out_valid2 && !decode_stall && !flush && !slot2_blocked;
+    wire slot1_wants_branch = fu_out_valid1 && (is_branch1 || is_return1);
+    wire slot2_wants_branch = fu_out_valid2 && (is_branch2 || is_return2);
 
+    wire block_slot1_for_branch = rob_has_unresolved_branch && slot1_wants_branch;
+    wire block_slot2_for_branch = rob_has_unresolved_branch && slot2_wants_branch;
+
+    // Valid dispatch signals
+    wire dispatch_valid1 = fu_out_valid1 && !decode_stall && !flush & !block_slot1_for_branch;
+    wire dispatch_valid2 = fu_out_valid2 && !decode_stall && !flush && !slot2_blocked && !block_slot2_for_branch;
     // ================================================================
     // RS dispatch signals (directly wired based on opcode and RR)
     // ================================================================
