@@ -3035,12 +3035,22 @@ module load_queue(
                 end
             end
 
-            // CDB output and free entry (respect backpressure). A selected memory read can
-            // complete directly to the CDB, avoiding a separate done->broadcast cycle.
+            // CDB output and free entry (respect backpressure).
             if (cdb_found && !cdb_stall) begin
                 lq_valid[cdb_slot] <= 0;
-            end else if (read_found && !cdb_stall) begin
-                lq_valid[read_slot] <= 0;
+            end
+
+            // Memory read completion:
+            // - Fast path: when no done entry is pending and CDB is available, complete directly.
+            // - Backpressured path: capture data into the entry and mark done so younger loads can
+            //   keep issuing memory reads while this result waits for CDB service.
+            if (read_found) begin
+                if (!cdb_stall && !cdb_found) begin
+                    lq_valid[read_slot] <= 0;
+                end else begin
+                    lq_mem_data[read_slot] <= read_data_now;
+                    lq_done[read_slot] <= 1'b1;
+                end
             end
 
             // Dispatch
