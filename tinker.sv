@@ -41,6 +41,7 @@ module tinker_core(
     wire [6:0]  cdb0_tag, cdb1_tag;
     wire [63:0] cdb0_value, cdb1_value;
     wire [4:0]  cdb0_rob, cdb1_rob;
+    wire [2:0]  cdb0_epoch, cdb1_epoch;
 
     // ================================================================
     // Wires: ROB
@@ -94,6 +95,8 @@ module tinker_core(
     wire [6:0]  rs_fpu0_issue_dest, rs_fpu1_issue_dest;
     wire [4:0]  rs_alu0_issue_rob, rs_alu1_issue_rob;
     wire [4:0]  rs_fpu0_issue_rob, rs_fpu1_issue_rob;
+    wire [2:0]  rs_alu0_issue_epoch, rs_alu1_issue_epoch;
+    wire [2:0]  rs_fpu0_issue_epoch, rs_fpu1_issue_epoch;
     wire [63:0] rs_alu0_issue_imm, rs_alu1_issue_imm;
     wire [63:0] rs_fpu0_issue_imm, rs_fpu1_issue_imm;
     wire [63:0] rs_alu0_issue_pc, rs_alu1_issue_pc;
@@ -106,11 +109,13 @@ module tinker_core(
     wire [6:0]  alu0_cdb_tag, alu1_cdb_tag;
     wire [63:0] alu0_cdb_value, alu1_cdb_value;
     wire [4:0]  alu0_cdb_rob, alu1_cdb_rob;
+    wire [2:0]  alu0_cdb_epoch, alu1_cdb_epoch;
     wire        alu0_issue_ready, alu1_issue_ready;
     wire        alu0_br_resolved, alu1_br_resolved;
     wire        alu0_br_taken, alu1_br_taken;
     wire [63:0] alu0_br_target, alu1_br_target;
     wire [4:0]  alu0_br_rob_idx, alu1_br_rob_idx;
+    wire [2:0]  alu0_br_epoch, alu1_br_epoch;
 
     // ================================================================
     // Wires: FPU Pipes (2)
@@ -119,6 +124,7 @@ module tinker_core(
     wire [6:0]  fpu0_cdb_tag, fpu1_cdb_tag;
     wire [63:0] fpu0_cdb_value, fpu1_cdb_value;
     wire [4:0]  fpu0_cdb_rob, fpu1_cdb_rob;
+    wire [2:0]  fpu0_cdb_epoch, fpu1_cdb_epoch;
     wire        fpu0_issue_ready, fpu1_issue_ready;
 
     // ================================================================
@@ -132,10 +138,12 @@ module tinker_core(
     wire [6:0]  lq_cdb_tag;
     wire [63:0] lq_cdb_value;
     wire [4:0]  lq_cdb_rob;
+    wire [2:0]  lq_cdb_epoch;
     wire        lq_br_resolved;
     wire        lq_br_taken;
     wire [63:0] lq_br_target;
     wire [4:0]  lq_br_rob_idx;
+    wire [2:0]  lq_br_epoch;
 
     // ================================================================
     // Wires: Store Queue
@@ -196,6 +204,8 @@ module tinker_core(
     reg        br_deferred_taken;
     reg [63:0] br_deferred_target;
     reg [4:0]  br_deferred_rob_idx;
+    reg [2:0]  br_deferred_epoch;
+    reg [2:0]  dispatch_epoch;
 
     // Count how many new sources are resolving this cycle
     wire [1:0] br_resolve_count = {1'b0, alu0_br_resolved} + {1'b0, alu1_br_resolved} + {1'b0, lq_br_resolved};
@@ -215,6 +225,10 @@ module tinker_core(
                                        alu0_br_resolved ? alu0_br_rob_idx :
                                        alu1_br_resolved ? alu1_br_rob_idx :
                                        lq_br_resolved   ? lq_br_rob_idx : 5'd0;
+    wire [2:0]  br_epoch_combined    = br_deferred_valid ? br_deferred_epoch :
+                                       alu0_br_resolved ? alu0_br_epoch :
+                                       alu1_br_resolved ? alu1_br_epoch :
+                                       lq_br_resolved   ? lq_br_epoch : 3'd0;
 
     // If we're servicing a deferred branch, defer the oldest new resolution (if any).
     // Otherwise, if multiple new resolutions arrive together, defer the second one.
@@ -238,6 +252,12 @@ module tinker_core(
                                    alu0_br_resolved && alu1_br_resolved ? alu1_br_rob_idx :
                                    alu0_br_resolved && lq_br_resolved   ? lq_br_rob_idx :
                                    alu1_br_resolved && lq_br_resolved   ? lq_br_rob_idx : 5'd0;
+    wire [2:0]  br_second_epoch  = br_deferred_valid ? (alu0_br_resolved ? alu0_br_epoch :
+                                                         alu1_br_resolved ? alu1_br_epoch :
+                                                         lq_br_epoch) :
+                                   alu0_br_resolved && alu1_br_resolved ? alu1_br_epoch :
+                                   alu0_br_resolved && lq_br_resolved   ? lq_br_epoch :
+                                   alu1_br_resolved && lq_br_resolved   ? lq_br_epoch : 3'd0;
 
     always @(posedge clk or posedge reset) begin
         if (reset || pipe_kill || flush) begin
@@ -248,6 +268,7 @@ module tinker_core(
             br_deferred_taken     <= br_second_taken;
             br_deferred_target    <= br_second_target;
             br_deferred_rob_idx   <= br_second_rob;
+            br_deferred_epoch     <= br_second_epoch;
         end else begin
             br_deferred_valid <= 1'b0;
         end
@@ -745,6 +766,7 @@ module tinker_core(
             alu_rr <= 1'b0;
             fpu_rr <= 1'b0;
             hlt <= 1'b0;
+            dispatch_epoch <= 3'd0;
             post_flush_stall <= 3'd0;
             snap_in_use <= 4'b0000;
             snap_owner_rob[0] <= 5'd0;
@@ -755,7 +777,8 @@ module tinker_core(
             // On flush, keep RR state (or reset - doesn't matter much)
             alu_rr <= 1'b0;
             fpu_rr <= 1'b0;
-            post_flush_stall <= 3'd2;
+            dispatch_epoch <= dispatch_epoch + 3'd1;
+            post_flush_stall <= 3'd0;
             // If a previously deferred branch is being serviced this cycle, free its
             // checkpoint slot even though flush bypasses the normal resolved-branch path.
             if (br_resolved_combined) begin
@@ -1053,6 +1076,7 @@ module tinker_core(
         .dispatch_src2_rdy(alu0_disp_src2_rdy),
         .dispatch_dest_tag(alu0_disp_dest),
         .dispatch_rob_idx(alu0_disp_rob_idx),
+        .dispatch_epoch(dispatch_epoch),
         .dispatch_imm(alu0_disp_imm),
         .dispatch_imm_tag(alu0_disp_imm_tag),
         .dispatch_imm_rdy(alu0_disp_imm_rdy),
@@ -1065,6 +1089,7 @@ module tinker_core(
         .issue_src2_val(rs_alu0_issue_src2),
         .issue_dest_tag(rs_alu0_issue_dest),
         .issue_rob_idx(rs_alu0_issue_rob),
+        .issue_epoch(rs_alu0_issue_epoch),
         .issue_imm(rs_alu0_issue_imm),
         .issue_pc(rs_alu0_issue_pc),
         .issue_ack(rs_alu0_issue_valid && alu0_issue_ready),
@@ -1087,6 +1112,7 @@ module tinker_core(
         .dispatch_src2_rdy(alu1_disp_src2_rdy),
         .dispatch_dest_tag(alu1_disp_dest),
         .dispatch_rob_idx(alu1_disp_rob_idx),
+        .dispatch_epoch(dispatch_epoch),
         .dispatch_imm(alu1_disp_imm),
         .dispatch_imm_tag(alu1_disp_imm_tag),
         .dispatch_imm_rdy(alu1_disp_imm_rdy),
@@ -1099,6 +1125,7 @@ module tinker_core(
         .issue_src2_val(rs_alu1_issue_src2),
         .issue_dest_tag(rs_alu1_issue_dest),
         .issue_rob_idx(rs_alu1_issue_rob),
+        .issue_epoch(rs_alu1_issue_epoch),
         .issue_imm(rs_alu1_issue_imm),
         .issue_pc(rs_alu1_issue_pc),
         .issue_ack(rs_alu1_issue_valid && alu1_issue_ready),
@@ -1121,6 +1148,7 @@ module tinker_core(
         .dispatch_src2_rdy(fpu0_disp_src2_rdy),
         .dispatch_dest_tag(fpu0_disp_dest),
         .dispatch_rob_idx(fpu0_disp_rob_idx),
+        .dispatch_epoch(dispatch_epoch),
         .dispatch_imm(fpu0_disp_imm),
         .dispatch_imm_tag(7'd0),
         .dispatch_imm_rdy(1'b1),
@@ -1133,6 +1161,7 @@ module tinker_core(
         .issue_src2_val(rs_fpu0_issue_src2),
         .issue_dest_tag(rs_fpu0_issue_dest),
         .issue_rob_idx(rs_fpu0_issue_rob),
+        .issue_epoch(rs_fpu0_issue_epoch),
         .issue_imm(rs_fpu0_issue_imm),
         .issue_pc(rs_fpu0_issue_pc),
         .issue_ack(rs_fpu0_issue_valid && fpu0_issue_ready),
@@ -1155,6 +1184,7 @@ module tinker_core(
         .dispatch_src2_rdy(fpu1_disp_src2_rdy),
         .dispatch_dest_tag(fpu1_disp_dest),
         .dispatch_rob_idx(fpu1_disp_rob_idx),
+        .dispatch_epoch(dispatch_epoch),
         .dispatch_imm(fpu1_disp_imm),
         .dispatch_imm_tag(7'd0),
         .dispatch_imm_rdy(1'b1),
@@ -1167,6 +1197,7 @@ module tinker_core(
         .issue_src2_val(rs_fpu1_issue_src2),
         .issue_dest_tag(rs_fpu1_issue_dest),
         .issue_rob_idx(rs_fpu1_issue_rob),
+        .issue_epoch(rs_fpu1_issue_epoch),
         .issue_imm(rs_fpu1_issue_imm),
         .issue_pc(rs_fpu1_issue_pc),
         .issue_ack(rs_fpu1_issue_valid && fpu1_issue_ready),
@@ -1186,6 +1217,7 @@ module tinker_core(
         .issue_src2(rs_alu0_issue_src2),
         .issue_dest_tag(rs_alu0_issue_dest),
         .issue_rob_idx(rs_alu0_issue_rob),
+        .issue_epoch(rs_alu0_issue_epoch),
         .issue_imm(rs_alu0_issue_imm),
         .issue_pc(rs_alu0_issue_pc),
         .issue_ready(alu0_issue_ready),
@@ -1193,10 +1225,12 @@ module tinker_core(
         .cdb_tag(alu0_cdb_tag),
         .cdb_value(alu0_cdb_value),
         .cdb_rob_idx(alu0_cdb_rob),
+        .cdb_epoch(alu0_cdb_epoch),
         .br_resolved(alu0_br_resolved),
         .br_taken(alu0_br_taken),
         .br_target(alu0_br_target),
         .br_rob_idx_out(alu0_br_rob_idx),
+        .br_epoch_out(alu0_br_epoch),
         .cdb_stall(cdb_alu0_stall),
         .flush(pipe_kill),
         .br_squash(br_squash),
@@ -1212,6 +1246,7 @@ module tinker_core(
         .issue_src2(rs_alu1_issue_src2),
         .issue_dest_tag(rs_alu1_issue_dest),
         .issue_rob_idx(rs_alu1_issue_rob),
+        .issue_epoch(rs_alu1_issue_epoch),
         .issue_imm(rs_alu1_issue_imm),
         .issue_pc(rs_alu1_issue_pc),
         .issue_ready(alu1_issue_ready),
@@ -1219,10 +1254,12 @@ module tinker_core(
         .cdb_tag(alu1_cdb_tag),
         .cdb_value(alu1_cdb_value),
         .cdb_rob_idx(alu1_cdb_rob),
+        .cdb_epoch(alu1_cdb_epoch),
         .br_resolved(alu1_br_resolved),
         .br_taken(alu1_br_taken),
         .br_target(alu1_br_target),
         .br_rob_idx_out(alu1_br_rob_idx),
+        .br_epoch_out(alu1_br_epoch),
         .cdb_stall(cdb_alu1_stall),
         .flush(pipe_kill),
         .br_squash(br_squash),
@@ -1239,22 +1276,26 @@ module tinker_core(
         .pipe0_issue_src2(rs_fpu0_issue_src2),
         .pipe0_issue_dest_tag(rs_fpu0_issue_dest),
         .pipe0_issue_rob_idx(rs_fpu0_issue_rob),
+        .pipe0_issue_epoch(rs_fpu0_issue_epoch),
         .pipe0_issue_ready(fpu0_issue_ready),
         .pipe0_cdb_valid(fpu0_cdb_valid),
         .pipe0_cdb_tag(fpu0_cdb_tag),
         .pipe0_cdb_value(fpu0_cdb_value),
         .pipe0_cdb_rob_idx(fpu0_cdb_rob),
+        .pipe0_cdb_epoch(fpu0_cdb_epoch),
         .pipe1_issue_valid(rs_fpu1_issue_valid),
         .pipe1_issue_opcode(rs_fpu1_issue_opcode),
         .pipe1_issue_src1(rs_fpu1_issue_src1),
         .pipe1_issue_src2(rs_fpu1_issue_src2),
         .pipe1_issue_dest_tag(rs_fpu1_issue_dest),
         .pipe1_issue_rob_idx(rs_fpu1_issue_rob),
+        .pipe1_issue_epoch(rs_fpu1_issue_epoch),
         .pipe1_issue_ready(fpu1_issue_ready),
         .pipe1_cdb_valid(fpu1_cdb_valid),
         .pipe1_cdb_tag(fpu1_cdb_tag),
         .pipe1_cdb_value(fpu1_cdb_value),
         .pipe1_cdb_rob_idx(fpu1_cdb_rob),
+        .pipe1_cdb_epoch(fpu1_cdb_epoch),
         .pipe0_cdb_stall(cdb_fpu0_stall),
         .pipe1_cdb_stall(cdb_fpu1_stall),
         .flush(pipe_kill),
@@ -1273,6 +1314,7 @@ module tinker_core(
         .dispatch_imm(lq_disp_imm),
         .dispatch_dest_tag(lq_disp_dest_tag),
         .dispatch_rob_idx(lq_disp_rob_idx),
+        .dispatch_epoch(dispatch_epoch),
         .dispatch_opcode(lq_disp_opcode),
         .cdb0_valid(cdb0_valid), .cdb0_tag(cdb0_tag), .cdb0_value(cdb0_value),
         .cdb1_valid(cdb1_valid), .cdb1_tag(cdb1_tag), .cdb1_value(cdb1_value),
@@ -1285,10 +1327,12 @@ module tinker_core(
         .cdb_tag(lq_cdb_tag),
         .cdb_value(lq_cdb_value),
         .cdb_rob_idx(lq_cdb_rob),
+        .cdb_epoch(lq_cdb_epoch),
         .br_resolved(lq_br_resolved),
         .br_taken(lq_br_taken),
         .br_target(lq_br_target),
         .br_rob_idx_out(lq_br_rob_idx),
+        .br_epoch_out(lq_br_epoch),
         .cdb_stall(cdb_lsu0_stall),
         .full(lq_full),
         .flush(pipe_kill),
@@ -1349,6 +1393,7 @@ module tinker_core(
         .alloc_pc1(fu_out_pc1),
         .alloc_branch_pred1(branch_pred1),
         .alloc_branch_target1(branch1_pred_target),
+        .alloc_epoch1(dispatch_epoch),
         .alloc_snap_id1(snap_id1),
         .alloc_idx1(rob_alloc_idx1),
         .alloc_en2(dispatch_valid2),
@@ -1358,14 +1403,17 @@ module tinker_core(
         .alloc_new_phys2(alloc_preg2 ? new_phys_rd2 : 7'd0),
         .alloc_pc2(fu_out_pc2),
         .alloc_branch_pred2(branch_pred2),
-        .alloc_branch_target2(64'd0),
+        .alloc_branch_target2(branch2_pred_target),
+        .alloc_epoch2(dispatch_epoch),
         .alloc_snap_id2(snap_id2),
         .alloc_idx2(rob_alloc_idx2),
         .cdb0_valid(cdb0_valid),
         .cdb0_rob_idx(cdb0_rob),
+        .cdb0_epoch(cdb0_epoch),
         .cdb0_value(cdb0_value),
         .cdb1_valid(cdb1_valid),
         .cdb1_rob_idx(cdb1_rob),
+        .cdb1_epoch(cdb1_epoch),
         .cdb1_value(cdb1_value),
         .sq_addr_ready(sq_rob_store_addr_ready),
         .sq_addr_rob_idx(sq_rob_store_addr_ready_idx),
@@ -1377,6 +1425,7 @@ module tinker_core(
         .br_taken(br_taken_combined),
         .br_target(br_target_combined),
         .br_rob_idx(br_rob_idx_combined),
+        .br_epoch(br_epoch_combined),
         .mispredict(rob_mispredict),
         .mispredict_target(rob_mispredict_target),
         .mispredict_rob_idx(rob_mispredict_rob_idx),
@@ -1434,22 +1483,27 @@ module tinker_core(
         .alu0_tag(alu0_cdb_tag),
         .alu0_value(alu0_cdb_value),
         .alu0_rob(alu0_cdb_rob),
+        .alu0_epoch(alu0_cdb_epoch),
         .fpu0_valid(fpu0_cdb_valid_masked),
         .fpu0_tag(fpu0_cdb_tag),
         .fpu0_value(fpu0_cdb_value),
         .fpu0_rob(fpu0_cdb_rob),
+        .fpu0_epoch(fpu0_cdb_epoch),
         .lsu0_valid(lq_cdb_valid),
         .lsu0_tag(lq_cdb_tag),
         .lsu0_value(lq_cdb_value),
         .lsu0_rob(lq_cdb_rob),
+        .lsu0_epoch(lq_cdb_epoch),
         .alu1_valid(alu1_cdb_valid_masked),
         .alu1_tag(alu1_cdb_tag),
         .alu1_value(alu1_cdb_value),
         .alu1_rob(alu1_cdb_rob),
+        .alu1_epoch(alu1_cdb_epoch),
         .fpu1_valid(fpu1_cdb_valid_masked),
         .fpu1_tag(fpu1_cdb_tag),
         .fpu1_value(fpu1_cdb_value),
         .fpu1_rob(fpu1_cdb_rob),
+        .fpu1_epoch(fpu1_cdb_epoch),
         .lsu1_valid(1'b0),    // tie off 2nd LSU input
         .lsu1_tag(7'd0),
         .lsu1_value(64'd0),
@@ -1458,10 +1512,12 @@ module tinker_core(
         .cdb0_tag(cdb0_tag),
         .cdb0_value(cdb0_value),
         .cdb0_rob(cdb0_rob),
+        .cdb0_epoch(cdb0_epoch),
         .cdb1_valid(cdb1_valid),
         .cdb1_tag(cdb1_tag),
         .cdb1_value(cdb1_value),
         .cdb1_rob(cdb1_rob),
+        .cdb1_epoch(cdb1_epoch),
         .alu0_stall(cdb_alu0_stall),
         .fpu0_stall(cdb_fpu0_stall),
         .lsu0_stall(cdb_lsu0_stall),
@@ -1890,6 +1946,7 @@ module reservation_station #(
     input dispatch_src2_rdy,
     input [6:0] dispatch_dest_tag,
     input [4:0] dispatch_rob_idx,
+    input [2:0] dispatch_epoch,
     input [63:0] dispatch_imm,
     input [6:0] dispatch_imm_tag,
     input dispatch_imm_rdy,
@@ -1910,6 +1967,7 @@ module reservation_station #(
     output reg [63:0] issue_src2_val,
     output reg [6:0] issue_dest_tag,
     output reg [4:0] issue_rob_idx,
+    output reg [2:0] issue_epoch,
     output reg [63:0] issue_imm,
     output reg [63:0] issue_pc,
     input issue_ack,
@@ -1949,6 +2007,7 @@ module reservation_station #(
     reg src2_rdy [0:NUM_ENTRIES-1];
     reg [6:0] dest_tag [0:NUM_ENTRIES-1];
     reg [4:0] rob_idx [0:NUM_ENTRIES-1];
+    reg [2:0] epoch [0:NUM_ENTRIES-1];
     reg [63:0] imm [0:NUM_ENTRIES-1];
     reg [6:0] imm_tag [0:NUM_ENTRIES-1];
     reg imm_rdy [0:NUM_ENTRIES-1];
@@ -2038,6 +2097,7 @@ module reservation_station #(
             issue_src2_val = wakeup_value(src2_rdy[issue_slot], src2_val[issue_slot], src2_tag[issue_slot]);
             issue_dest_tag = dest_tag[issue_slot];
             issue_rob_idx = rob_idx[issue_slot];
+            issue_epoch = epoch[issue_slot];
             issue_imm = wakeup_value(imm_rdy[issue_slot], imm[issue_slot], imm_tag[issue_slot]);
             issue_pc = pc[issue_slot];
         end else begin
@@ -2046,6 +2106,7 @@ module reservation_station #(
             issue_src2_val = 0;
             issue_dest_tag = 0;
             issue_rob_idx = 0;
+            issue_epoch = 0;
             issue_imm = 0;
             issue_pc = 0;
         end
@@ -2118,6 +2179,7 @@ module reservation_station #(
                 src2_rdy[free_slot] <= dispatch_src2_rdy;
                 dest_tag[free_slot] <= dispatch_dest_tag;
                 rob_idx[free_slot] <= dispatch_rob_idx;
+                epoch[free_slot] <= dispatch_epoch;
                 imm[free_slot] <= dispatch_imm;
                 imm_tag[free_slot] <= dispatch_imm_tag;
                 imm_rdy[free_slot] <= dispatch_imm_rdy;
@@ -2144,6 +2206,7 @@ module alu_pipe(
     input [63:0] issue_src2,
     input [6:0] issue_dest_tag,
     input [4:0] issue_rob_idx,
+    input [2:0] issue_epoch,
     input [63:0] issue_imm,
     input [63:0] issue_pc,
     output issue_ready,
@@ -2153,12 +2216,14 @@ module alu_pipe(
     output reg [6:0] cdb_tag,
     output reg [63:0] cdb_value,
     output reg [4:0] cdb_rob_idx,
+    output reg [2:0] cdb_epoch,
 
     // Branch resolution
     output reg br_resolved,
     output reg br_taken,
     output reg [63:0] br_target,
     output reg [4:0] br_rob_idx_out,
+    output reg [2:0] br_epoch_out,
 
     input cdb_stall,
     input flush,
@@ -2223,6 +2288,7 @@ module alu_pipe(
     reg        s1_has_result;     // instruction produces a register result
     reg [6:0]  s1_dest_tag;
     reg [4:0]  s1_rob_idx;
+    reg [2:0]  s1_epoch;
 
     // ========================================================================
     // Stage 1 combinational logic: Decode + operand select + condition eval
@@ -2478,6 +2544,7 @@ module alu_pipe(
                 s1_has_result <= s1_hasres_next;
                 s1_dest_tag   <= issue_dest_tag;
                 s1_rob_idx    <= issue_rob_idx;
+                s1_epoch      <= issue_epoch;
             end
 
             // ---- Stage 2 output (Execute results -> CDB) ----
@@ -2485,12 +2552,14 @@ module alu_pipe(
             cdb_tag     <= s1_dest_tag;
             cdb_value   <= s2_result_comb;
             cdb_rob_idx <= s1_rob_idx;
+            cdb_epoch   <= s1_epoch;
 
             // ---- Branch resolution output (from stage 2 execution) ----
             br_resolved    <= s1_valid && s1_is_branch;
             br_taken       <= s1_br_taken;
             br_target      <= s2_brtgt_comb;
             br_rob_idx_out <= s1_rob_idx;
+            br_epoch_out   <= s1_epoch;
         end
     end
 
@@ -2510,6 +2579,7 @@ module fpu_pipe(
     input [63:0] issue_src2,
     input [6:0] issue_dest_tag,
     input [4:0] issue_rob_idx,
+    input [2:0] issue_epoch,
     output issue_ready,
 
     // CDB output
@@ -2517,6 +2587,7 @@ module fpu_pipe(
     output reg [6:0] cdb_tag,
     output reg [63:0] cdb_value,
     output reg [4:0] cdb_rob_idx,
+    output reg [2:0] cdb_epoch,
 
     input cdb_stall,
     input flush,
@@ -2541,6 +2612,7 @@ module fpu_pipe(
     reg [63:0] s1_src1, s1_src2;
     reg [6:0]  s1_dest_tag, s2_dest_tag, s3_dest_tag, s4_dest_tag, s5_dest_tag;
     reg [4:0]  s1_rob_idx,  s2_rob_idx,  s3_rob_idx,  s4_rob_idx,  s5_rob_idx;
+    reg [2:0]  s1_epoch, s2_epoch, s3_epoch, s4_epoch, s5_epoch;
     reg [63:0] s2_result, s3_result, s4_result, s5_result;
 
     wire [63:0] s1_negated_src2 = {~s1_src2[63], s1_src2[62:0]};
@@ -2598,32 +2670,38 @@ module fpu_pipe(
                 s1_src2     <= issue_src2;
                 s1_dest_tag <= issue_dest_tag;
                 s1_rob_idx  <= issue_rob_idx;
+                s1_epoch    <= issue_epoch;
             end
 
             s2_valid    <= s1_valid;
             s2_result   <= s1_result_comb;
             s2_dest_tag <= s1_dest_tag;
             s2_rob_idx  <= s1_rob_idx;
+            s2_epoch    <= s1_epoch;
 
             s3_valid    <= s2_valid;
             s3_result   <= s2_result;
             s3_dest_tag <= s2_dest_tag;
             s3_rob_idx  <= s2_rob_idx;
+            s3_epoch    <= s2_epoch;
 
             s4_valid    <= s3_valid;
             s4_result   <= s3_result;
             s4_dest_tag <= s3_dest_tag;
             s4_rob_idx  <= s3_rob_idx;
+            s4_epoch    <= s3_epoch;
 
             s5_valid    <= s4_valid;
             s5_result   <= s4_result;
             s5_dest_tag <= s4_dest_tag;
             s5_rob_idx  <= s4_rob_idx;
+            s5_epoch    <= s4_epoch;
 
             cdb_valid   <= s5_valid;
             cdb_tag     <= s5_dest_tag;
             cdb_value   <= s5_result;
             cdb_rob_idx <= s5_rob_idx;
+            cdb_epoch   <= s5_epoch;
         end
     end
 
@@ -2643,11 +2721,13 @@ module fpu_unit(
     input [63:0] pipe0_issue_src2,
     input [6:0]  pipe0_issue_dest_tag,
     input [4:0]  pipe0_issue_rob_idx,
+    input [2:0]  pipe0_issue_epoch,
     output       pipe0_issue_ready,
     output       pipe0_cdb_valid,
     output [6:0] pipe0_cdb_tag,
     output [63:0] pipe0_cdb_value,
     output [4:0] pipe0_cdb_rob_idx,
+    output [2:0] pipe0_cdb_epoch,
 
     // FPU pipe 1
     input        pipe1_issue_valid,
@@ -2656,11 +2736,13 @@ module fpu_unit(
     input [63:0] pipe1_issue_src2,
     input [6:0]  pipe1_issue_dest_tag,
     input [4:0]  pipe1_issue_rob_idx,
+    input [2:0]  pipe1_issue_epoch,
     output       pipe1_issue_ready,
     output       pipe1_cdb_valid,
     output [6:0] pipe1_cdb_tag,
     output [63:0] pipe1_cdb_value,
     output [4:0] pipe1_cdb_rob_idx,
+    output [2:0] pipe1_cdb_epoch,
 
     input pipe0_cdb_stall,
     input pipe1_cdb_stall,
@@ -2678,11 +2760,13 @@ module fpu_unit(
         .issue_src2(pipe0_issue_src2),
         .issue_dest_tag(pipe0_issue_dest_tag),
         .issue_rob_idx(pipe0_issue_rob_idx),
+        .issue_epoch(pipe0_issue_epoch),
         .issue_ready(pipe0_issue_ready),
         .cdb_valid(pipe0_cdb_valid),
         .cdb_tag(pipe0_cdb_tag),
         .cdb_value(pipe0_cdb_value),
         .cdb_rob_idx(pipe0_cdb_rob_idx),
+        .cdb_epoch(pipe0_cdb_epoch),
         .cdb_stall(pipe0_cdb_stall),
         .flush(flush),
         .br_squash(br_squash),
@@ -2698,11 +2782,13 @@ module fpu_unit(
         .issue_src2(pipe1_issue_src2),
         .issue_dest_tag(pipe1_issue_dest_tag),
         .issue_rob_idx(pipe1_issue_rob_idx),
+        .issue_epoch(pipe1_issue_epoch),
         .issue_ready(pipe1_issue_ready),
         .cdb_valid(pipe1_cdb_valid),
         .cdb_tag(pipe1_cdb_tag),
         .cdb_value(pipe1_cdb_value),
         .cdb_rob_idx(pipe1_cdb_rob_idx),
+        .cdb_epoch(pipe1_cdb_epoch),
         .cdb_stall(pipe1_cdb_stall),
         .flush(flush),
         .br_squash(br_squash),
@@ -2727,6 +2813,7 @@ module load_queue(
     input [63:0] dispatch_imm,
     input [6:0] dispatch_dest_tag,
     input [4:0] dispatch_rob_idx,
+    input [2:0] dispatch_epoch,
     input [4:0] dispatch_opcode,
 
     // CDB snoop (2 buses)
@@ -2751,12 +2838,14 @@ module load_queue(
     output wire [6:0] cdb_tag,
     output wire [63:0] cdb_value,
     output wire [4:0] cdb_rob_idx,
+    output wire [2:0] cdb_epoch,
 
     // Branch resolution (for RETURN instructions)
     output wire br_resolved,
     output wire br_taken,
     output wire [63:0] br_target,
     output wire [4:0] br_rob_idx_out,
+    output wire [2:0] br_epoch_out,
 
     // CDB backpressure
     input cdb_stall,
@@ -2794,6 +2883,7 @@ module load_queue(
     reg [63:0] lq_imm [0:NUM_ENTRIES-1];
     reg [6:0] lq_dest_tag [0:NUM_ENTRIES-1];
     reg [4:0] lq_rob_idx [0:NUM_ENTRIES-1];
+    reg [2:0] lq_epoch [0:NUM_ENTRIES-1];
     reg [4:0] lq_opcode [0:NUM_ENTRIES-1];
     reg lq_addr_computed [0:NUM_ENTRIES-1];
     reg [63:0] lq_addr [0:NUM_ENTRIES-1];
@@ -2885,12 +2975,14 @@ module load_queue(
     assign cdb_tag = use_done_slot ? lq_dest_tag[cdb_slot] : lq_dest_tag[read_slot];
     assign cdb_value = use_done_slot ? lq_mem_data[cdb_slot] : read_data_now;
     assign cdb_rob_idx = use_done_slot ? lq_rob_idx[cdb_slot] : lq_rob_idx[read_slot];
+    assign cdb_epoch = use_done_slot ? lq_epoch[cdb_slot] : lq_epoch[read_slot];
 
     assign br_resolved = !flush && !cdb_stall && ((use_done_slot && cdb_is_return) ||
                                                   (use_read_slot && read_is_return));
     assign br_taken = br_resolved;
     assign br_target = use_done_slot ? lq_mem_data[cdb_slot] : read_data_now;
     assign br_rob_idx_out = use_done_slot ? lq_rob_idx[cdb_slot] : lq_rob_idx[read_slot];
+    assign br_epoch_out = use_done_slot ? lq_epoch[cdb_slot] : lq_epoch[read_slot];
 
     integer i;
     always @(posedge clk or posedge rst) begin
@@ -2958,6 +3050,7 @@ module load_queue(
                 lq_imm[free_slot] <= dispatch_imm;
                 lq_dest_tag[free_slot] <= dispatch_dest_tag;
                 lq_rob_idx[free_slot] <= dispatch_rob_idx;
+                lq_epoch[free_slot] <= dispatch_epoch;
                 lq_opcode[free_slot] <= dispatch_opcode;
                 lq_addr[free_slot] <= dispatch_base_val + dispatch_imm;
                 lq_addr_computed[free_slot] <= dispatch_base_ready;
@@ -3285,6 +3378,7 @@ module rob(
     input  wire [63:0] alloc_pc1,
     input  wire        alloc_branch_pred1,
     input  wire [63:0] alloc_branch_target1,
+    input  wire [2:0]  alloc_epoch1,
     input  wire [1:0]  alloc_snap_id1,
     output wire [4:0]  alloc_idx1,
 
@@ -3297,17 +3391,20 @@ module rob(
     input  wire [63:0] alloc_pc2,
     input  wire        alloc_branch_pred2,
     input  wire [63:0] alloc_branch_target2,
+    input  wire [2:0]  alloc_epoch2,
     input  wire [1:0]  alloc_snap_id2,
     output wire [4:0]  alloc_idx2,
 
     // CDB completion bus 0
     input  wire        cdb0_valid,
     input  wire [4:0]  cdb0_rob_idx,
+    input  wire [2:0]  cdb0_epoch,
     input  wire [63:0] cdb0_value,
 
     // CDB completion bus 1
     input  wire        cdb1_valid,
     input  wire [4:0]  cdb1_rob_idx,
+    input  wire [2:0]  cdb1_epoch,
     input  wire [63:0] cdb1_value,
 
     // Store queue notifications
@@ -3323,6 +3420,7 @@ module rob(
     input  wire        br_taken,
     input  wire [63:0] br_target,
     input  wire [4:0]  br_rob_idx,
+    input  wire [2:0]  br_epoch,
 
     // Mispredict outputs
     output reg         mispredict,
@@ -3385,6 +3483,7 @@ module rob(
     reg        store_addr_rdy [0:DEPTH-1];
     reg        store_data_rdy [0:DEPTH-1];
     reg [63:0] result         [0:DEPTH-1];
+    reg [2:0]  entry_epoch    [0:DEPTH-1];
     reg [1:0]  snap_id        [0:DEPTH-1];
 
     reg [4:0] head, tail;
@@ -3438,6 +3537,7 @@ module rob(
                 branch_resolved_flag[i] <= 0;
                 store_addr_rdy[i] <= 0;
                 store_data_rdy[i] <= 0;
+                entry_epoch[i] <= 3'd0;
             end
         end else begin
             // Default outputs
@@ -3460,11 +3560,11 @@ module rob(
                 alloc_count = 0;
 
             // --- CDB completion ---
-            if (cdb0_valid && valid[cdb0_rob_idx]) begin
+            if (cdb0_valid && valid[cdb0_rob_idx] && entry_epoch[cdb0_rob_idx] == cdb0_epoch) begin
                 complete[cdb0_rob_idx] <= 1;
                 result[cdb0_rob_idx] <= cdb0_value;
             end
-            if (cdb1_valid && valid[cdb1_rob_idx]) begin
+            if (cdb1_valid && valid[cdb1_rob_idx] && entry_epoch[cdb1_rob_idx] == cdb1_epoch) begin
                 complete[cdb1_rob_idx] <= 1;
                 result[cdb1_rob_idx] <= cdb1_value;
             end
@@ -3480,7 +3580,7 @@ module rob(
             end
 
             // --- Branch resolution ---
-            if (br_resolved && valid[br_rob_idx]) begin
+            if (br_resolved && valid[br_rob_idx] && entry_epoch[br_rob_idx] == br_epoch) begin
                 branch_resolved_flag[br_rob_idx] <= 1;
                 branch_actual_taken[br_rob_idx] <= br_taken;
                 branch_actual_target[br_rob_idx] <= br_target;
@@ -3533,18 +3633,18 @@ module rob(
                 is_store1 = (itype[head] == ITYPE_STORE);
                 is_store2 = (itype[head2] == ITYPE_STORE);
                 head_complete_now = complete[head] ||
-                                    (cdb0_valid && !flush_all && cdb0_rob_idx == head) ||
-                                    (cdb1_valid && !flush_all && cdb1_rob_idx == head) ||
-                                    (br_resolved && br_rob_idx == head);
+                                    (cdb0_valid && !flush_all && cdb0_rob_idx == head && entry_epoch[head] == cdb0_epoch) ||
+                                    (cdb1_valid && !flush_all && cdb1_rob_idx == head && entry_epoch[head] == cdb1_epoch) ||
+                                    (br_resolved && !flush_all && br_rob_idx == head && entry_epoch[head] == br_epoch);
                 head2_complete_now = complete[head2] ||
-                                     (cdb0_valid && !flush_all && cdb0_rob_idx == head2) ||
-                                     (cdb1_valid && !flush_all && cdb1_rob_idx == head2) ||
-                                     (br_resolved && br_rob_idx == head2);
-                head_result_now = (cdb0_valid && !flush_all && cdb0_rob_idx == head) ? cdb0_value :
-                                  (cdb1_valid && !flush_all && cdb1_rob_idx == head) ? cdb1_value :
+                                     (cdb0_valid && !flush_all && cdb0_rob_idx == head2 && entry_epoch[head2] == cdb0_epoch) ||
+                                     (cdb1_valid && !flush_all && cdb1_rob_idx == head2 && entry_epoch[head2] == cdb1_epoch) ||
+                                     (br_resolved && !flush_all && br_rob_idx == head2 && entry_epoch[head2] == br_epoch);
+                head_result_now = (cdb0_valid && !flush_all && cdb0_rob_idx == head && entry_epoch[head] == cdb0_epoch) ? cdb0_value :
+                                  (cdb1_valid && !flush_all && cdb1_rob_idx == head && entry_epoch[head] == cdb1_epoch) ? cdb1_value :
                                   result[head];
-                head2_result_now = (cdb0_valid && !flush_all && cdb0_rob_idx == head2) ? cdb0_value :
-                                   (cdb1_valid && !flush_all && cdb1_rob_idx == head2) ? cdb1_value :
+                head2_result_now = (cdb0_valid && !flush_all && cdb0_rob_idx == head2 && entry_epoch[head2] == cdb0_epoch) ? cdb0_value :
+                                   (cdb1_valid && !flush_all && cdb1_rob_idx == head2 && entry_epoch[head2] == cdb1_epoch) ? cdb1_value :
                                    result[head2];
                 head_store_addr_now = store_addr_rdy[head] ||
                                       (sq_addr_ready && sq_addr_rob_idx == head);
@@ -3640,6 +3740,7 @@ module rob(
                 pc[tail] <= alloc_pc1;
                 branch_pred[tail] <= alloc_branch_pred1;
                 branch_target_pred[tail] <= alloc_branch_target1;
+                entry_epoch[tail] <= alloc_epoch1;
                 snap_id[tail] <= alloc_snap_id1;
                 branch_resolved_flag[tail] <= 0;
                 store_addr_rdy[tail] <= 0;
@@ -3656,6 +3757,7 @@ module rob(
                     pc[tail + 5'd1] <= alloc_pc2;
                     branch_pred[tail + 5'd1] <= alloc_branch_pred2;
                     branch_target_pred[tail + 5'd1] <= alloc_branch_target2;
+                    entry_epoch[tail + 5'd1] <= alloc_epoch2;
                     snap_id[tail + 5'd1] <= alloc_snap_id2;
                     branch_resolved_flag[tail + 5'd1] <= 0;
                     store_addr_rdy[tail + 5'd1] <= 0;
@@ -3803,30 +3905,35 @@ module cdb_arbiter(
     input  wire [6:0]  alu0_tag,
     input  wire [63:0] alu0_value,
     input  wire [4:0]  alu0_rob,
+    input  wire [2:0]  alu0_epoch,
 
     // Producer inputs - FPU pipe 0
     input  wire        fpu0_valid,
     input  wire [6:0]  fpu0_tag,
     input  wire [63:0] fpu0_value,
     input  wire [4:0]  fpu0_rob,
+    input  wire [2:0]  fpu0_epoch,
 
     // Producer inputs - LSU pipe 0
     input  wire        lsu0_valid,
     input  wire [6:0]  lsu0_tag,
     input  wire [63:0] lsu0_value,
     input  wire [4:0]  lsu0_rob,
+    input  wire [2:0]  lsu0_epoch,
 
     // Producer inputs - ALU pipe 1
     input  wire        alu1_valid,
     input  wire [6:0]  alu1_tag,
     input  wire [63:0] alu1_value,
     input  wire [4:0]  alu1_rob,
+    input  wire [2:0]  alu1_epoch,
 
     // Producer inputs - FPU pipe 1
     input  wire        fpu1_valid,
     input  wire [6:0]  fpu1_tag,
     input  wire [63:0] fpu1_value,
     input  wire [4:0]  fpu1_rob,
+    input  wire [2:0]  fpu1_epoch,
 
     // Producer inputs - LSU pipe 1
     input  wire        lsu1_valid,
@@ -3839,12 +3946,14 @@ module cdb_arbiter(
     output wire [6:0]  cdb0_tag,
     output wire [63:0] cdb0_value,
     output wire [4:0]  cdb0_rob,
+    output wire [2:0]  cdb0_epoch,
 
     // CDB bus 1 outputs
     output wire        cdb1_valid,
     output wire [6:0]  cdb1_tag,
     output wire [63:0] cdb1_value,
     output wire [4:0]  cdb1_rob,
+    output wire [2:0]  cdb1_epoch,
 
     // Stall outputs
     output wire        alu0_stall,
@@ -3864,6 +3973,7 @@ module cdb_arbiter(
     assign cdb0_tag   = bus0_sel_alu0 ? alu0_tag   : (bus0_sel_fpu0 ? fpu0_tag   : lsu0_tag);
     assign cdb0_value = bus0_sel_alu0 ? alu0_value : (bus0_sel_fpu0 ? fpu0_value : lsu0_value);
     assign cdb0_rob   = bus0_sel_alu0 ? alu0_rob   : (bus0_sel_fpu0 ? fpu0_rob   : lsu0_rob);
+    assign cdb0_epoch = bus0_sel_alu0 ? alu0_epoch : (bus0_sel_fpu0 ? fpu0_epoch : lsu0_epoch);
 
     // Bus 1 priority: alu1 > fpu1 > lsu1
     wire bus1_sel_alu1 = alu1_valid;
@@ -3874,6 +3984,7 @@ module cdb_arbiter(
     assign cdb1_tag   = bus1_sel_alu1 ? alu1_tag   : (bus1_sel_fpu1 ? fpu1_tag   : lsu1_tag);
     assign cdb1_value = bus1_sel_alu1 ? alu1_value : (bus1_sel_fpu1 ? fpu1_value : lsu1_value);
     assign cdb1_rob   = bus1_sel_alu1 ? alu1_rob   : (bus1_sel_fpu1 ? fpu1_rob   : lsu1_rob);
+    assign cdb1_epoch = bus1_sel_alu1 ? alu1_epoch : (bus1_sel_fpu1 ? fpu1_epoch : 3'd0);
 
     // Stall signals: producer is valid but didn't get the bus
     assign alu0_stall = 1'b0;  // alu0 always wins bus 0
