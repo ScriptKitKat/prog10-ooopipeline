@@ -1312,11 +1312,12 @@ module tinker_core(
         .dispatch_opcode(sq_disp_opcode),
         .cdb0_valid(cdb0_valid), .cdb0_tag(cdb0_tag), .cdb0_value(cdb0_value),
         .cdb1_valid(cdb1_valid), .cdb1_tag(cdb1_tag), .cdb1_value(cdb1_value),
-        // CALL also creates an SQ entry even though its ROB type is BRANCH. Commit any
-        // ROB entry that has a matching SQ slot; non-store/non-call instructions simply miss.
-        .commit_en(rob_commit_en1 || rob_commit_en2),
-        .commit_rob_idx(rob_commit_en1 ?
-                        rob_commit_rob_idx1 : rob_commit_rob_idx2),
+        // CALL also creates an SQ entry even though its ROB type is BRANCH.
+        // Probe both ROB commit slots so a slot-2 store/call cannot leak in SQ.
+        .commit_en1(rob_commit_en1),
+        .commit_rob_idx1(rob_commit_rob_idx1),
+        .commit_en2(rob_commit_en2),
+        .commit_rob_idx2(rob_commit_rob_idx2),
         .mem_write_en(sq_mem_write_en),
         .mem_write_addr(sq_mem_write_addr),
         .mem_write_data(sq_mem_write_data),
@@ -2996,9 +2997,11 @@ module store_queue(
     input [6:0] cdb1_tag,
     input [63:0] cdb1_value,
 
-    // Commit interface
-    input commit_en,
-    input [4:0] commit_rob_idx,
+    // Commit interface (2 ROB slots; SQ itself still commits at most one entry/cycle)
+    input commit_en1,
+    input [4:0] commit_rob_idx1,
+    input commit_en2,
+    input [4:0] commit_rob_idx2,
     output reg mem_write_en,
     output reg [63:0] mem_write_addr,
     output reg [63:0] mem_write_data,
@@ -3102,7 +3105,7 @@ module store_queue(
         end
     end
 
-    // Commit: find matching entry by rob_idx
+    // Commit: find matching entry by rob_idx (check both ROB commit slots)
     integer cm_i;
     reg [3:0] commit_slot;
     reg commit_found;
@@ -3112,9 +3115,20 @@ module store_queue(
         mem_write_en = 0;
         mem_write_addr = 64'd0;
         mem_write_data = 64'd0;
-        if (commit_en) begin
+        if (commit_en1) begin
             for (cm_i = 0; cm_i < NUM_ENTRIES; cm_i = cm_i + 1) begin
-                if (sq_valid[cm_i] && sq_rob_idx[cm_i] == commit_rob_idx && !commit_found) begin
+                if (sq_valid[cm_i] && sq_rob_idx[cm_i] == commit_rob_idx1 && !commit_found) begin
+                    commit_slot = cm_i[3:0];
+                    commit_found = 1;
+                    mem_write_en = 1;
+                    mem_write_addr = sq_addr[cm_i];
+                    mem_write_data = sq_data_val[cm_i];
+                end
+            end
+        end
+        if (commit_en2 && !commit_found) begin
+            for (cm_i = 0; cm_i < NUM_ENTRIES; cm_i = cm_i + 1) begin
+                if (sq_valid[cm_i] && sq_rob_idx[cm_i] == commit_rob_idx2 && !commit_found) begin
                     commit_slot = cm_i[3:0];
                     commit_found = 1;
                     mem_write_en = 1;
@@ -3215,7 +3229,7 @@ module store_queue(
             end
 
             // Commit: free the matching SQ entry after the write has been driven combinationally.
-            if (commit_en && commit_found) begin
+            if (commit_found) begin
                 sq_valid[commit_slot] <= 0;
             end
 
