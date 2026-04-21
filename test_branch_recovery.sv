@@ -57,8 +57,8 @@ module test_branch_recovery;
                      dut.rob_has_unresolved_branch);
             $finish;
         end
-        if (dut.decode_stall !== 1'b0 || dut.dispatch_valid1 !== 1'b1 || dut.dispatch_valid2 !== 1'b1) begin
-            $display("FAIL branch_recovery dispatch_window decode_stall=%b dispatch_valid1=%b dispatch_valid2=%b",
+        if (dut.decode_stall !== 1'b0 || dut.dispatch_valid1 !== 1'b1 || dut.dispatch_valid2 !== 1'b0) begin
+            $display("FAIL branch_recovery nonbranch_should_flow decode_stall=%b dispatch_valid1=%b dispatch_valid2=%b",
                      dut.decode_stall, dut.dispatch_valid1, dut.dispatch_valid2);
             $finish;
         end
@@ -66,10 +66,9 @@ module test_branch_recovery;
         @(posedge clk);
         #1;
 
-        // We seeded count=1; with slot1+slot2 both dispatched, ROB should now hold >=3 entries.
-        if (dut.rob_inst.count < 6'd3) begin
-            $display("FAIL branch_recovery dual_dispatch_not_observed rob_count=%0d fb_head=%0d",
-                     dut.rob_inst.count, dut.fu_inst.fb_head);
+        if (dut.fu_inst.fb_head !== 4'd1) begin
+            $display("FAIL branch_recovery nonbranch_did_not_advance fb_head=%0d",
+                     dut.fu_inst.fb_head);
             $finish;
         end
 

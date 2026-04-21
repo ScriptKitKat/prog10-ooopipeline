@@ -461,7 +461,8 @@ module tinker_core(
         ((is_load1 || is_return1) && (is_load2 || is_return2)) ||
         ((is_store1_only || is_call1) && (is_store2_only || is_call2));
     wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 &&
-                                 (is_branch1 || is_return1);
+                                 ((is_branch1 || is_return1) ||
+                                  ((is_branch2 || is_return2) && rob_has_unresolved_branch));
     wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
 
     assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 ||
