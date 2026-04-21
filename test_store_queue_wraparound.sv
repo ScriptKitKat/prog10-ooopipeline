@@ -39,7 +39,7 @@ module test_store_queue_wraparound;
     reg [4:0] load_exec_rob_idx;
     reg [4:0] load_exec_pc_idx;
 
-    wire dep_has_unresolved_store;
+    wire dep_has_older_unresolved_store;
     wire violation_valid;
     wire [4:0] violation_pc_idx;
     wire fwd_hit;
@@ -92,7 +92,7 @@ module test_store_queue_wraparound;
         .load_exec_addr(load_exec_addr),
         .load_exec_rob_idx(load_exec_rob_idx),
         .load_exec_pc_idx(load_exec_pc_idx),
-        .dep_has_unresolved_store(dep_has_unresolved_store),
+        .dep_has_older_unresolved_store(dep_has_older_unresolved_store),
         .violation_valid(violation_valid),
         .violation_pc_idx(violation_pc_idx),
         .fwd_hit(fwd_hit),
@@ -178,8 +178,11 @@ module test_store_queue_wraparound;
         @(posedge clk);
         #1;
         dispatch_en = 1'b0;
+        fwd_check_addr = 64'h1000;
+        fwd_check_rob_idx = 5'd2;
+        #1;
 
-        if (!dep_has_unresolved_store) begin
+        if (!dep_has_older_unresolved_store) begin
             $display("FAIL unresolved-store tracking should be set");
             $finish(1);
         end

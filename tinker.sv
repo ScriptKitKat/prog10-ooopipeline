@@ -132,6 +132,7 @@ module tinker_core(
     // Wires: Load Queue
     // ================================================================
     wire        lq_full;
+    wire        lq_can_alloc2;
     wire        lq_mem_read_en;
     wire [63:0] lq_mem_read_addr;
     wire [4:0]  lq_mem_read_rob_idx;
@@ -140,6 +141,9 @@ module tinker_core(
     wire [63:0] lq_load_exec_addr;
     wire [4:0]  lq_load_exec_rob_idx;
     wire [4:0]  lq_load_exec_pc_idx;
+    wire        lq_dep_check_en;
+    wire [63:0] lq_dep_check_addr;
+    wire [4:0]  lq_dep_check_rob_idx;
     wire        lq_cdb_valid;
     wire [6:0]  lq_cdb_tag;
     wire [63:0] lq_cdb_value;
@@ -165,7 +169,7 @@ module tinker_core(
     wire [4:0]  sq_rob_store_data_ready_idx;
     wire [63:0] sq_rob_store_addr_value;
     wire [63:0] sq_rob_store_ready_value;
-    wire        sq_has_unresolved_store;
+    wire        sq_has_older_unresolved_store;
     wire        sq_violation_valid;
     wire [4:0]  sq_violation_pc_idx;
 
@@ -202,9 +206,9 @@ module tinker_core(
     wire br_squash = flush;
     wire [4:0] br_squash_rob_idx = rob_mispredict_rob_idx;
     wire [4:0] rob_recover_tail;
-    reg arch_prf_sync_pending;
     reg [2:0] post_flush_stall;
     reg [31:0] mem_dep_wait_table;
+    reg startup_guard;
 
     // ================================================================
     // Branch resolution: combine from ALU pipes + LQ with overflow queue
@@ -456,7 +460,7 @@ module tinker_core(
 
     wire target_full2 = (is_alu2 && !alu0_avail2 && !alu1_avail2) ||
                         (is_fpu2 && !fpu0_avail2 && !fpu1_avail2) ||
-                        ((is_load2 || is_return2) && lq_full) ||
+                        ((is_load2 || is_return2) && !lq_can_alloc2) ||
                         ((is_store2 || is_call2) && sq_full);
 
     // After instr1 dispatches to an ALU/FPU RS, toggle RR for instr2
@@ -474,13 +478,18 @@ module tinker_core(
     wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
 
     assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 ||
-                        arch_prf_sync_pending ||
                         (post_flush_stall != 3'd0) ||
                         hlt || rob_halt_committed ||
                         (fu_out_valid1 && target_full1);
 
     wire slot1_wants_branch = fu_out_valid1 && (is_branch1 || is_return1);
     wire slot2_wants_branch = fu_out_valid2 && (is_branch2 || is_return2);
+    // Startup guard policy:
+    // - Keep branch_recovery behavior: if slot2 is branch while slot1 is non-branch, stall both.
+    // - Otherwise prefer progress on slot1 and only hold slot2 during warmup.
+    wire startup_stall_all = startup_guard && slot2_wants_branch && !slot1_wants_branch;
+    wire startup_allow_dual_load = startup_guard && fu_out_valid1 && fu_out_valid2 && is_load1 && is_load2;
+    wire startup_stall_slot2 = startup_guard && !startup_stall_all && !startup_allow_dual_load;
 
     // The checkpointed RAT/free-list currently has 4 snapshot slots. Track allocation/free by
     // owning ROB index so out-of-order branch resolution cannot overwrite a live checkpoint.
@@ -503,8 +512,10 @@ module tinker_core(
                                   !branch2_pre_resolve_cond;
 
     // Valid dispatch signals
-    wire dispatch_valid1 = fu_out_valid1 && !decode_stall && !flush && !block_slot1_for_branch;
-    wire dispatch_valid2 = fu_out_valid2 && !decode_stall && !flush && !slot2_blocked && !block_slot2_for_branch;
+    wire dispatch_valid1 = fu_out_valid1 && !decode_stall && !flush && !block_slot1_for_branch &&
+                           !startup_stall_all;
+    wire dispatch_valid2 = fu_out_valid2 && !decode_stall && !flush && !slot2_blocked && !block_slot2_for_branch &&
+                           !startup_stall_all && !startup_stall_slot2;
     // ================================================================
     // RS dispatch signals (directly wired based on opcode and RR)
     // ================================================================
@@ -795,6 +806,7 @@ module tinker_core(
             hlt <= 1'b0;
             dispatch_epoch <= 3'd0;
             post_flush_stall <= 3'd0;
+            startup_guard <= 1'b1;
             snap_in_use <= 4'b0000;
             mem_dep_wait_table <= 32'b0;
             snap_owner_rob[0] <= 5'd0;
@@ -838,6 +850,8 @@ module tinker_core(
         end else begin
             if (rob_halt_committed)
                 hlt <= 1'b1;
+            if (startup_guard)
+                startup_guard <= 1'b0;
             if (post_flush_stall != 3'd0)
                 post_flush_stall <= post_flush_stall - 3'd1;
 
@@ -1360,7 +1374,10 @@ module tinker_core(
         .load_exec_addr(lq_load_exec_addr),
         .load_exec_rob_idx(lq_load_exec_rob_idx),
         .load_exec_pc_idx(lq_load_exec_pc_idx),
-        .sq_has_unresolved_store(sq_has_unresolved_store),
+        .dep_check_en(lq_dep_check_en),
+        .dep_check_addr(lq_dep_check_addr),
+        .dep_check_rob_idx(lq_dep_check_rob_idx),
+        .sq_has_older_unresolved_store(sq_has_older_unresolved_store),
         .sq_fwd_valid(sq_fwd_hit),
         .sq_fwd_data(sq_fwd_data),
         .cdb_valid(lq_cdb_valid),
@@ -1378,7 +1395,8 @@ module tinker_core(
         .flush(pipe_kill),
         .br_squash(br_squash),
         .br_squash_rob_idx(br_squash_rob_idx),
-        .recover_tail(rob_recover_tail)
+        .recover_tail(rob_recover_tail),
+        .can_alloc2(lq_can_alloc2)
     );
 
     // --- Store Queue ---
@@ -1408,12 +1426,15 @@ module tinker_core(
         .fwd_check_en(lq_mem_read_en),
         .fwd_check_addr(lq_mem_read_addr),
         .fwd_check_rob_idx(lq_mem_read_rob_idx),
+        .dep_check_en(lq_dep_check_en),
+        .dep_check_addr(lq_dep_check_addr),
+        .dep_check_rob_idx(lq_dep_check_rob_idx),
         .rob_head_idx(rob_head_idx),
         .load_exec_valid(lq_load_exec_valid),
         .load_exec_addr(lq_load_exec_addr),
         .load_exec_rob_idx(lq_load_exec_rob_idx),
         .load_exec_pc_idx(lq_load_exec_pc_idx),
-        .dep_has_unresolved_store(sq_has_unresolved_store),
+        .dep_has_older_unresolved_store(sq_has_older_unresolved_store),
         .violation_valid(sq_violation_valid),
         .violation_pc_idx(sq_violation_pc_idx),
         .fwd_hit(sq_fwd_hit),
@@ -1503,17 +1524,12 @@ module tinker_core(
 
     // --- Sync architectural register file to physical register file ---
     // The autograder may pre-load values into reg_file.registers while reset is high.
-    // Since the OOO pipeline reads from the PRF, copy once on the first live cycle.
+    // Copy on reset deassert so dispatch doesn't lose a startup cycle.
     integer sync_i;
-    always @(posedge clk or posedge reset) begin
-        if (reset) begin
-            arch_prf_sync_pending <= 1'b1;
-        end else if (arch_prf_sync_pending) begin
-            for (sync_i = 0; sync_i < 32; sync_i = sync_i + 1) begin
-                prf_inst.regs[sync_i] = reg_file.registers[sync_i];
-                prf_inst.ready[sync_i] = 1'b1;
-            end
-            arch_prf_sync_pending <= 1'b0;
+    always @(negedge reset) begin
+        for (sync_i = 0; sync_i < 32; sync_i = sync_i + 1) begin
+            prf_inst.regs[sync_i] = reg_file.registers[sync_i];
+            prf_inst.ready[sync_i] = 1'b1;
         end
     end
 
@@ -2888,7 +2904,10 @@ module load_queue(
     output wire [63:0] load_exec_addr,
     output wire [4:0] load_exec_rob_idx,
     output wire [4:0] load_exec_pc_idx,
-    input sq_has_unresolved_store,
+    output wire dep_check_en,
+    output wire [63:0] dep_check_addr,
+    output wire [4:0] dep_check_rob_idx,
+    input sq_has_older_unresolved_store,
 
     // Store-to-load forwarding
     input sq_fwd_valid,
@@ -2918,7 +2937,8 @@ module load_queue(
     // Selective branch squash
     input br_squash,
     input [4:0] br_squash_rob_idx,
-    input [4:0] recover_tail
+    input [4:0] recover_tail,
+    output can_alloc2
 );
 
     parameter NUM_ENTRIES = 16;
@@ -2965,6 +2985,7 @@ module load_queue(
             if (lq_valid[vc]) valid_count = valid_count + 1;
     end
     assign full = (valid_count == NUM_ENTRIES);
+    assign can_alloc2 = (valid_count <= NUM_ENTRIES - 2);
 
     // Find free slot
     integer fi;
@@ -2986,13 +3007,13 @@ module load_queue(
     reg [3:0] read_slot;
     reg read_found;
     reg [4:0] read_min_age;
+    wire read_dep_blocked;
     always @(*) begin
         read_found = 0;
         read_slot = 0;
         read_min_age = 5'h1f;
         for (si = 0; si < NUM_ENTRIES; si = si + 1) begin
-            if (lq_valid[si] && lq_addr_computed[si] && !lq_done[si] &&
-                !(lq_dep_wait[si] && sq_has_unresolved_store)) begin
+            if (lq_valid[si] && lq_addr_computed[si] && !lq_done[si]) begin
                 if (!read_found || lq_age[si] < read_min_age) begin
                     read_slot = si[3:0];
                     read_min_age = lq_age[si];
@@ -3001,17 +3022,50 @@ module load_queue(
             end
         end
     end
+    assign dep_check_en = read_found && lq_dep_wait[read_slot];
+    assign dep_check_addr = read_found ? lq_addr[read_slot] : 64'd0;
+    assign dep_check_rob_idx = read_found ? lq_rob_idx[read_slot] : 5'd0;
+
+    assign read_dep_blocked = read_found &&
+                              lq_dep_wait[read_slot] &&
+                              sq_has_older_unresolved_store;
+
+    // Fallback candidate: if the oldest dependent load is blocked, let the oldest ready
+    // non-dependent load issue so memory bandwidth is not wasted.
+    integer si_nd;
+    reg [3:0] read_slot_nd;
+    reg read_found_nd;
+    reg [4:0] read_min_age_nd;
+    always @(*) begin
+        read_found_nd = 1'b0;
+        read_slot_nd = 4'd0;
+        read_min_age_nd = 5'h1f;
+        for (si_nd = 0; si_nd < NUM_ENTRIES; si_nd = si_nd + 1) begin
+            if (lq_valid[si_nd] && lq_addr_computed[si_nd] && !lq_done[si_nd] && !lq_dep_wait[si_nd]) begin
+                if (!read_found_nd || lq_age[si_nd] < read_min_age_nd) begin
+                    read_slot_nd = si_nd[3:0];
+                    read_min_age_nd = lq_age[si_nd];
+                    read_found_nd = 1'b1;
+                end
+            end
+        end
+    end
+
+    wire issue_fallback = read_found && read_dep_blocked && read_found_nd;
+    wire issue_found = issue_fallback ? read_found_nd : read_found;
+    wire [3:0] issue_slot = issue_fallback ? read_slot_nd : read_slot;
+    wire issue_dep_blocked = issue_fallback ? 1'b0 : read_dep_blocked;
 
     // Memory read request
     always @(*) begin
-        mem_read_en = read_found;
-        mem_read_addr = read_found ? lq_addr[read_slot] : 64'd0;
+        mem_read_en = issue_found && !issue_dep_blocked;
+        mem_read_addr = issue_found ? lq_addr[issue_slot] : 64'd0;
     end
-    assign mem_read_rob_idx = read_found ? lq_rob_idx[read_slot] : 5'd0;
-    assign load_exec_valid = !flush && read_found;
-    assign load_exec_addr = read_found ? lq_addr[read_slot] : 64'd0;
-    assign load_exec_rob_idx = read_found ? lq_rob_idx[read_slot] : 5'd0;
-    assign load_exec_pc_idx = read_found ? lq_pc_idx[read_slot] : 5'd0;
+    assign mem_read_rob_idx = issue_found ? lq_rob_idx[issue_slot] : 5'd0;
+    assign load_exec_valid = !flush && issue_found && !issue_dep_blocked;
+    assign load_exec_addr = issue_found ? lq_addr[issue_slot] : 64'd0;
+    assign load_exec_rob_idx = issue_found ? lq_rob_idx[issue_slot] : 5'd0;
+    assign load_exec_pc_idx = issue_found ? lq_pc_idx[issue_slot] : 5'd0;
 
     // Find oldest done entry to output on CDB
     integer ci;
@@ -3033,25 +3087,25 @@ module load_queue(
         end
     end
 
-    wire read_is_return = read_found && (lq_opcode[read_slot] == 5'h0d);
+    wire read_is_return = issue_found && (lq_opcode[issue_slot] == 5'h0d);
     wire cdb_is_return  = cdb_found  && (lq_opcode[cdb_slot]  == 5'h0d);
     wire use_done_slot  = cdb_found;
-    wire use_read_slot  = !cdb_found && read_found;
+    wire use_read_slot  = !cdb_found && issue_found && !issue_dep_blocked;
     wire [63:0] read_data_now = sq_fwd_valid ? sq_fwd_data : mem_read_data;
 
     assign cdb_valid = !flush && ((use_done_slot && !cdb_is_return) ||
                                   (use_read_slot && !read_is_return));
-    assign cdb_tag = use_done_slot ? lq_dest_tag[cdb_slot] : lq_dest_tag[read_slot];
+    assign cdb_tag = use_done_slot ? lq_dest_tag[cdb_slot] : lq_dest_tag[issue_slot];
     assign cdb_value = use_done_slot ? lq_mem_data[cdb_slot] : read_data_now;
-    assign cdb_rob_idx = use_done_slot ? lq_rob_idx[cdb_slot] : lq_rob_idx[read_slot];
-    assign cdb_epoch = use_done_slot ? lq_epoch[cdb_slot] : lq_epoch[read_slot];
+    assign cdb_rob_idx = use_done_slot ? lq_rob_idx[cdb_slot] : lq_rob_idx[issue_slot];
+    assign cdb_epoch = use_done_slot ? lq_epoch[cdb_slot] : lq_epoch[issue_slot];
 
     assign br_resolved = !flush && !cdb_stall && ((use_done_slot && cdb_is_return) ||
                                                   (use_read_slot && read_is_return));
     assign br_taken = br_resolved;
     assign br_target = use_done_slot ? lq_mem_data[cdb_slot] : read_data_now;
-    assign br_rob_idx_out = use_done_slot ? lq_rob_idx[cdb_slot] : lq_rob_idx[read_slot];
-    assign br_epoch_out = use_done_slot ? lq_epoch[cdb_slot] : lq_epoch[read_slot];
+    assign br_rob_idx_out = use_done_slot ? lq_rob_idx[cdb_slot] : lq_rob_idx[issue_slot];
+    assign br_epoch_out = use_done_slot ? lq_epoch[cdb_slot] : lq_epoch[issue_slot];
 
     integer i;
     always @(posedge clk or posedge rst) begin
@@ -3111,12 +3165,12 @@ module load_queue(
             // - Fast path: when no done entry is pending and CDB is available, complete directly.
             // - Backpressured path: capture data into the entry and mark done so younger loads can
             //   keep issuing memory reads while this result waits for CDB service.
-            if (read_found) begin
+            if (issue_found && !issue_dep_blocked) begin
                 if (!cdb_stall && !cdb_found) begin
-                    lq_valid[read_slot] <= 0;
+                    lq_valid[issue_slot] <= 0;
                 end else begin
-                    lq_mem_data[read_slot] <= read_data_now;
-                    lq_done[read_slot] <= 1'b1;
+                    lq_mem_data[issue_slot] <= read_data_now;
+                    lq_done[issue_slot] <= 1'b1;
                 end
             end
 
@@ -3131,7 +3185,7 @@ module load_queue(
                 lq_rob_idx[free_slot] <= dispatch_rob_idx;
                 lq_epoch[free_slot] <= dispatch_epoch;
                 lq_pc_idx[free_slot] <= dispatch_pc_idx;
-                lq_dep_wait[free_slot] <= dispatch_dep_wait;
+                lq_dep_wait[free_slot] <= (dispatch_dep_wait === 1'b1);
                 lq_opcode[free_slot] <= dispatch_opcode;
                 lq_addr[free_slot] <= dispatch_base_val + dispatch_imm;
                 lq_addr_computed[free_slot] <= dispatch_base_ready;
@@ -3184,12 +3238,15 @@ module store_queue(
     input fwd_check_en,
     input [63:0] fwd_check_addr,
     input [4:0] fwd_check_rob_idx,
+    input dep_check_en,
+    input [63:0] dep_check_addr,
+    input [4:0] dep_check_rob_idx,
     input [4:0] rob_head_idx,
     input load_exec_valid,
     input [63:0] load_exec_addr,
     input [4:0] load_exec_rob_idx,
     input [4:0] load_exec_pc_idx,
-    output reg dep_has_unresolved_store,
+    output reg dep_has_older_unresolved_store,
     output wire violation_valid,
     output wire [4:0] violation_pc_idx,
     output reg fwd_hit,
@@ -3305,13 +3362,30 @@ module store_queue(
         end
     end
 
-    // A predicted-dependent load should wait while any store is still unresolved.
+    // A predicted-dependent load should wait when an OLDER store is unresolved in a way
+    // that could still alias this load (unknown address, or known-equal address with unknown data).
+    // Keep backward compatibility with direct SQ tests that only drive fwd_check_* by
+    // falling back when dep_check_* is left unconnected.
+    wire dep_use_new_probe = (dep_check_en === 1'b1);
+    wire dep_probe_en = dep_use_new_probe ? dep_check_en : 1'b1;
+    wire [63:0] dep_probe_addr = dep_use_new_probe ? dep_check_addr : fwd_check_addr;
+    wire [4:0] dep_probe_rob_idx = dep_use_new_probe ? dep_check_rob_idx : fwd_check_rob_idx;
     integer dep_i;
+    reg [4:0] dep_store_dist;
+    reg [4:0] dep_load_dist;
     always @(*) begin
-        dep_has_unresolved_store = 1'b0;
-        for (dep_i = 0; dep_i < NUM_ENTRIES; dep_i = dep_i + 1) begin
-            if (sq_valid[dep_i] && (!sq_addr_computed[dep_i] || !sq_data_ready[dep_i]))
-                dep_has_unresolved_store = 1'b1;
+        dep_has_older_unresolved_store = 1'b0;
+        dep_load_dist = dep_probe_rob_idx - rob_head_idx;
+        if (dep_probe_en && !flush) begin
+            for (dep_i = 0; dep_i < NUM_ENTRIES; dep_i = dep_i + 1) begin
+                dep_store_dist = sq_rob_idx[dep_i] - rob_head_idx;
+                if (sq_valid[dep_i] && (dep_store_dist < dep_load_dist) &&
+                    (!sq_addr_computed[dep_i] ||
+                     (sq_addr_computed[dep_i] &&
+                      sq_addr[dep_i] == dep_probe_addr &&
+                      !sq_data_ready[dep_i])))
+                    dep_has_older_unresolved_store = 1'b1;
+            end
         end
     end
 
@@ -4064,6 +4138,17 @@ module fetch_unit(
             // Single update to fb_count combining drain and fill
             fb_count <= fb_count - {3'b0, drain_cnt} + to_enqueue;
         end
+    end
+
+    // Prime the fetch buffer at reset deassert to remove the cold-start fill bubble.
+    always @(negedge rst) begin
+        for (j = 0; j < 16; j = j + 1) begin
+            fbuf[j] <= {`START + {58'b0, j[3:0], 2'b0}, fetch_data[j*32 +: 32]};
+        end
+        fb_head <= 4'd0;
+        fb_tail <= 4'd0;
+        fb_count <= 5'd16;
+        pc_reg <= `START + 64'd64;
     end
 
 endmodule
