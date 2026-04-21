@@ -1540,6 +1540,7 @@ module tinker_core(
         .lsu1_tag(7'd0),
         .lsu1_value(64'd0),
         .lsu1_rob(5'd0),
+        .lsu1_epoch(3'd0),
         .cdb0_valid(cdb0_valid),
         .cdb0_tag(cdb0_tag),
         .cdb0_value(cdb0_value),
@@ -3981,6 +3982,7 @@ module cdb_arbiter(
     input  wire [6:0]  lsu1_tag,
     input  wire [63:0] lsu1_value,
     input  wire [4:0]  lsu1_rob,
+    input  wire [2:0]  lsu1_epoch,
 
     // CDB bus 0 outputs
     output wire        cdb0_valid,
@@ -4065,7 +4067,7 @@ module cdb_arbiter(
     assign cdb1_tag   = bus1_sel_alu1 ? alu1_tag   : (bus1_sel_fpu1 ? fpu1_tag   : lsu1_tag);
     assign cdb1_value = bus1_sel_alu1 ? alu1_value : (bus1_sel_fpu1 ? fpu1_value : lsu1_value);
     assign cdb1_rob   = bus1_sel_alu1 ? alu1_rob   : (bus1_sel_fpu1 ? fpu1_rob   : lsu1_rob);
-    assign cdb1_epoch = bus1_sel_alu1 ? alu1_epoch : (bus1_sel_fpu1 ? fpu1_epoch : 3'd0);
+    assign cdb1_epoch = bus1_sel_alu1 ? alu1_epoch : (bus1_sel_fpu1 ? fpu1_epoch : lsu1_epoch);
 
     // Stall signals: producer is valid but didn't get the bus
     assign alu0_stall = alu0_valid && !bus0_sel_alu0;

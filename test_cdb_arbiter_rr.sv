@@ -57,6 +57,7 @@ module test_cdb_arbiter_rr;
         .lsu1_tag(lsu1_tag),
         .lsu1_value(lsu1_value),
         .lsu1_rob(lsu1_rob),
+        .lsu1_epoch(3'd0),
         .cdb0_valid(cdb0_valid),
         .cdb0_tag(cdb0_tag),
         .cdb0_value(cdb0_value),
