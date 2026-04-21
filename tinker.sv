@@ -458,7 +458,9 @@ module tinker_core(
     wire slot2_singleq_conflict =
         ((is_load1 || is_return1) && (is_load2 || is_return2)) ||
         ((is_store1_only || is_call1) && (is_store2_only || is_call2));
-    wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 && (is_branch1 || is_return1 || is_branch2 || is_return2);
+    wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 &&
+                                 ((is_branch1 || is_return1) ||
+                                  ((is_branch2 || is_return2) && rob_has_unresolved_branch));
     wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
 
     assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 ||
@@ -478,12 +480,17 @@ module tinker_core(
                                !snap_in_use[1] ? 2'd1 :
                                !snap_in_use[2] ? 2'd2 : 2'd3;
     wire branch_snapshot_pool_full = &snap_in_use;
-    wire block_slot1_for_branch = branch_snapshot_pool_full && slot1_wants_branch;
+    wire branch1_pre_resolve_cond;
+    wire branch2_pre_resolve_cond;
+    wire block_slot1_for_branch = branch_snapshot_pool_full && slot1_wants_branch &&
+                                  !branch1_pre_resolve_cond;
     wire slot1_branch_will_dispatch = slot1_wants_branch && !decode_stall && !flush && !block_slot1_for_branch;
-    wire [3:0] snap_in_use_after_slot1_est = slot1_branch_will_dispatch ?
+    wire slot1_snap_will_dispatch = slot1_branch_will_dispatch && !branch1_pre_resolve_cond;
+    wire [3:0] snap_in_use_after_slot1_est = slot1_snap_will_dispatch ?
                                              (snap_in_use | (4'b0001 << snap_pick_id1)) :
                                              snap_in_use;
-    wire block_slot2_for_branch = (&snap_in_use_after_slot1_est) && slot2_wants_branch;
+    wire block_slot2_for_branch = (&snap_in_use_after_slot1_est) && slot2_wants_branch &&
+                                  !branch2_pre_resolve_cond;
 
     // Valid dispatch signals
     wire dispatch_valid1 = fu_out_valid1 && !decode_stall && !flush && !block_slot1_for_branch;
@@ -742,6 +749,14 @@ module tinker_core(
         (opcode2 == 5'h0a) ? (fu_out_pc2 + imm2) :
                               src1_val2;
     wire branch_pred2 = dispatch_valid2 && is_branch2 && branch2_target_ready && !branch_pred1;
+    assign branch1_pre_resolve_cond = is_branch1 && branch1_target_ready &&
+                                      (opcode1 == 5'h08 || opcode1 == 5'h09 ||
+                                       opcode1 == 5'h0a || opcode1 == 5'h0c);
+    assign branch2_pre_resolve_cond = is_branch2 && branch2_target_ready &&
+                                      (opcode2 == 5'h08 || opcode2 == 5'h09 ||
+                                       opcode2 == 5'h0a || opcode2 == 5'h0c);
+    wire branch1_pre_resolve = dispatch_valid1 && branch1_pre_resolve_cond;
+    wire branch2_pre_resolve = dispatch_valid2 && branch2_pre_resolve_cond;
     wire pred_redirect = branch_pred1 || branch_pred2;
     wire [63:0] pred_redirect_pc = branch_pred1 ? branch1_pred_target : branch2_pred_target;
 
@@ -749,8 +764,8 @@ module tinker_core(
     // Snapshot ID management for branch RAT checkpoints
     // ================================================================
     wire [1:0] snap_id1 = snap_pick_id1;
-    wire take_snap1 = dispatch_valid1 && (is_branch1 || is_return1);
-    wire take_snap2 = dispatch_valid2 && (is_branch2 || is_return2);
+    wire take_snap1 = dispatch_valid1 && ((is_branch1 && !branch1_pre_resolve) || is_return1);
+    wire take_snap2 = dispatch_valid2 && ((is_branch2 && !branch2_pre_resolve) || is_return2);
     wire [3:0] snap_in_use_after_slot1 = take_snap1 ?
                                          (snap_in_use | (4'b0001 << snap_id1)) :
                                          snap_in_use;
