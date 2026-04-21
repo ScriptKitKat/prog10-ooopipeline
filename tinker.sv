@@ -136,6 +136,10 @@ module tinker_core(
     wire [63:0] lq_mem_read_addr;
     wire [4:0]  lq_mem_read_rob_idx;
     wire [63:0] lq_mem_read_data;
+    wire        lq_load_exec_valid;
+    wire [63:0] lq_load_exec_addr;
+    wire [4:0]  lq_load_exec_rob_idx;
+    wire [4:0]  lq_load_exec_pc_idx;
     wire        lq_cdb_valid;
     wire [6:0]  lq_cdb_tag;
     wire [63:0] lq_cdb_value;
@@ -161,6 +165,9 @@ module tinker_core(
     wire [4:0]  sq_rob_store_data_ready_idx;
     wire [63:0] sq_rob_store_addr_value;
     wire [63:0] sq_rob_store_ready_value;
+    wire        sq_has_unresolved_store;
+    wire        sq_violation_valid;
+    wire [4:0]  sq_violation_pc_idx;
 
     // ================================================================
     // Wires: CDB Arbiter stalls
@@ -197,6 +204,7 @@ module tinker_core(
     wire [4:0] rob_recover_tail;
     reg arch_prf_sync_pending;
     reg [2:0] post_flush_stall;
+    reg [31:0] mem_dep_wait_table;
 
     // ================================================================
     // Branch resolution: combine from ALU pipes + LQ with overflow queue
@@ -680,6 +688,8 @@ module tinker_core(
     wire [6:0]  lq_disp_dest_tag = lq_disp_from1 ? new_phys_rd1 : new_phys_rd2;
     wire [4:0]  lq_disp_rob_idx  = lq_disp_from1 ? rob_alloc_idx1 : rob_alloc_idx2;
     wire [4:0]  lq_disp_opcode   = lq_disp_from1 ? opcode1 : opcode2;
+    wire [4:0]  lq_disp_pc_idx   = lq_disp_from1 ? fu_out_pc1[6:2] : fu_out_pc2[6:2];
+    wire        lq_disp_dep_wait = mem_dep_wait_table[lq_disp_pc_idx];
     // For RETURN: base = r31's phys mapping
     // We handle this by having src1_areg for RETURN be r31 in the earlier mux
 
@@ -786,6 +796,7 @@ module tinker_core(
             dispatch_epoch <= 3'd0;
             post_flush_stall <= 3'd0;
             snap_in_use <= 4'b0000;
+            mem_dep_wait_table <= 32'b0;
             snap_owner_rob[0] <= 5'd0;
             snap_owner_rob[1] <= 5'd0;
             snap_owner_rob[2] <= 5'd0;
@@ -841,6 +852,11 @@ module tinker_core(
                 if (dispatch_valid2 && is_fpu2)
                     fpu_rr <= dispatch_valid1 && is_fpu1 ? fpu_rr : ~fpu_rr;
             end
+
+            // Learn memory dependency behavior from detected store-load violations.
+            // A set bit means loads from that PC index should wait when unresolved stores exist.
+            if (sq_violation_valid)
+                mem_dep_wait_table[sq_violation_pc_idx] <= 1'b1;
 
             // Free snapshot slot when its owning branch resolves.
             if (br_resolved_combined) begin
@@ -1331,6 +1347,8 @@ module tinker_core(
         .dispatch_dest_tag(lq_disp_dest_tag),
         .dispatch_rob_idx(lq_disp_rob_idx),
         .dispatch_epoch(dispatch_epoch),
+        .dispatch_pc_idx(lq_disp_pc_idx),
+        .dispatch_dep_wait(lq_disp_dep_wait),
         .dispatch_opcode(lq_disp_opcode),
         .cdb0_valid(cdb0_valid), .cdb0_tag(cdb0_tag), .cdb0_value(cdb0_value),
         .cdb1_valid(cdb1_valid), .cdb1_tag(cdb1_tag), .cdb1_value(cdb1_value),
@@ -1338,6 +1356,11 @@ module tinker_core(
         .mem_read_addr(lq_mem_read_addr),
         .mem_read_rob_idx(lq_mem_read_rob_idx),
         .mem_read_data(lq_mem_read_data_wire),
+        .load_exec_valid(lq_load_exec_valid),
+        .load_exec_addr(lq_load_exec_addr),
+        .load_exec_rob_idx(lq_load_exec_rob_idx),
+        .load_exec_pc_idx(lq_load_exec_pc_idx),
+        .sq_has_unresolved_store(sq_has_unresolved_store),
         .sq_fwd_valid(sq_fwd_hit),
         .sq_fwd_data(sq_fwd_data),
         .cdb_valid(lq_cdb_valid),
@@ -1386,6 +1409,13 @@ module tinker_core(
         .fwd_check_addr(lq_mem_read_addr),
         .fwd_check_rob_idx(lq_mem_read_rob_idx),
         .rob_head_idx(rob_head_idx),
+        .load_exec_valid(lq_load_exec_valid),
+        .load_exec_addr(lq_load_exec_addr),
+        .load_exec_rob_idx(lq_load_exec_rob_idx),
+        .load_exec_pc_idx(lq_load_exec_pc_idx),
+        .dep_has_unresolved_store(sq_has_unresolved_store),
+        .violation_valid(sq_violation_valid),
+        .violation_pc_idx(sq_violation_pc_idx),
         .fwd_hit(sq_fwd_hit),
         .fwd_data(sq_fwd_data),
         .rob_store_addr_ready(sq_rob_store_addr_ready),
@@ -2837,6 +2867,8 @@ module load_queue(
     input [6:0] dispatch_dest_tag,
     input [4:0] dispatch_rob_idx,
     input [2:0] dispatch_epoch,
+    input [4:0] dispatch_pc_idx,
+    input dispatch_dep_wait,
     input [4:0] dispatch_opcode,
 
     // CDB snoop (2 buses)
@@ -2852,6 +2884,11 @@ module load_queue(
     output reg [63:0] mem_read_addr,
     output wire [4:0] mem_read_rob_idx,
     input [63:0] mem_read_data,
+    output wire load_exec_valid,
+    output wire [63:0] load_exec_addr,
+    output wire [4:0] load_exec_rob_idx,
+    output wire [4:0] load_exec_pc_idx,
+    input sq_has_unresolved_store,
 
     // Store-to-load forwarding
     input sq_fwd_valid,
@@ -2908,6 +2945,8 @@ module load_queue(
     reg [6:0] lq_dest_tag [0:NUM_ENTRIES-1];
     reg [4:0] lq_rob_idx [0:NUM_ENTRIES-1];
     reg [2:0] lq_epoch [0:NUM_ENTRIES-1];
+    reg [4:0] lq_pc_idx [0:NUM_ENTRIES-1];
+    reg lq_dep_wait [0:NUM_ENTRIES-1];
     reg [4:0] lq_opcode [0:NUM_ENTRIES-1];
     reg lq_addr_computed [0:NUM_ENTRIES-1];
     reg [63:0] lq_addr [0:NUM_ENTRIES-1];
@@ -2952,7 +2991,8 @@ module load_queue(
         read_slot = 0;
         read_min_age = 5'h1f;
         for (si = 0; si < NUM_ENTRIES; si = si + 1) begin
-            if (lq_valid[si] && lq_addr_computed[si] && !lq_done[si]) begin
+            if (lq_valid[si] && lq_addr_computed[si] && !lq_done[si] &&
+                !(lq_dep_wait[si] && sq_has_unresolved_store)) begin
                 if (!read_found || lq_age[si] < read_min_age) begin
                     read_slot = si[3:0];
                     read_min_age = lq_age[si];
@@ -2968,6 +3008,10 @@ module load_queue(
         mem_read_addr = read_found ? lq_addr[read_slot] : 64'd0;
     end
     assign mem_read_rob_idx = read_found ? lq_rob_idx[read_slot] : 5'd0;
+    assign load_exec_valid = !flush && read_found;
+    assign load_exec_addr = read_found ? lq_addr[read_slot] : 64'd0;
+    assign load_exec_rob_idx = read_found ? lq_rob_idx[read_slot] : 5'd0;
+    assign load_exec_pc_idx = read_found ? lq_pc_idx[read_slot] : 5'd0;
 
     // Find oldest done entry to output on CDB
     integer ci;
@@ -3086,6 +3130,8 @@ module load_queue(
                 lq_dest_tag[free_slot] <= dispatch_dest_tag;
                 lq_rob_idx[free_slot] <= dispatch_rob_idx;
                 lq_epoch[free_slot] <= dispatch_epoch;
+                lq_pc_idx[free_slot] <= dispatch_pc_idx;
+                lq_dep_wait[free_slot] <= dispatch_dep_wait;
                 lq_opcode[free_slot] <= dispatch_opcode;
                 lq_addr[free_slot] <= dispatch_base_val + dispatch_imm;
                 lq_addr_computed[free_slot] <= dispatch_base_ready;
@@ -3139,6 +3185,13 @@ module store_queue(
     input [63:0] fwd_check_addr,
     input [4:0] fwd_check_rob_idx,
     input [4:0] rob_head_idx,
+    input load_exec_valid,
+    input [63:0] load_exec_addr,
+    input [4:0] load_exec_rob_idx,
+    input [4:0] load_exec_pc_idx,
+    output reg dep_has_unresolved_store,
+    output wire violation_valid,
+    output wire [4:0] violation_pc_idx,
     output reg fwd_hit,
     output reg [63:0] fwd_data,
 
@@ -3191,6 +3244,13 @@ module store_queue(
     reg [4:0] sq_age [0:NUM_ENTRIES-1];
 
     reg [4:0] age_counter;
+
+    // Recently executed loads used for dependency-violation learning.
+    reg lh_valid [0:NUM_ENTRIES-1];
+    reg [63:0] lh_addr [0:NUM_ENTRIES-1];
+    reg [4:0] lh_rob_idx [0:NUM_ENTRIES-1];
+    reg [4:0] lh_pc_idx [0:NUM_ENTRIES-1];
+    reg [3:0] lh_wr_ptr;
 
     // Full detection
     integer vc;
@@ -3245,6 +3305,47 @@ module store_queue(
         end
     end
 
+    // A predicted-dependent load should wait while any store is still unresolved.
+    integer dep_i;
+    always @(*) begin
+        dep_has_unresolved_store = 1'b0;
+        for (dep_i = 0; dep_i < NUM_ENTRIES; dep_i = dep_i + 1) begin
+            if (sq_valid[dep_i] && (!sq_addr_computed[dep_i] || !sq_data_ready[dep_i]))
+                dep_has_unresolved_store = 1'b1;
+        end
+    end
+
+    // Detect store-load ordering violations:
+    // if an older store resolves to the same address after a younger load already executed.
+    integer v_s, v_l;
+    reg violation_found;
+    reg [4:0] violation_pc_idx_r;
+    reg [3:0] violation_lh_slot;
+    reg [4:0] violation_store_dist;
+    reg [4:0] violation_load_dist;
+    always @(*) begin
+        violation_found = 1'b0;
+        violation_pc_idx_r = 5'd0;
+        violation_lh_slot = 4'd0;
+        for (v_s = 0; v_s < NUM_ENTRIES; v_s = v_s + 1) begin
+            if (sq_valid[v_s] && sq_addr_computed[v_s] && sq_data_ready[v_s] && !violation_found) begin
+                violation_store_dist = sq_rob_idx[v_s] - rob_head_idx;
+                for (v_l = 0; v_l < NUM_ENTRIES; v_l = v_l + 1) begin
+                    if (lh_valid[v_l] && lh_addr[v_l] == sq_addr[v_s]) begin
+                        violation_load_dist = lh_rob_idx[v_l] - rob_head_idx;
+                        if (violation_store_dist < violation_load_dist && !violation_found) begin
+                            violation_found = 1'b1;
+                            violation_pc_idx_r = lh_pc_idx[v_l];
+                            violation_lh_slot = v_l[3:0];
+                        end
+                    end
+                end
+            end
+        end
+    end
+    assign violation_valid = violation_found;
+    assign violation_pc_idx = violation_pc_idx_r;
+
     // Commit: find matching entry by rob_idx (check both ROB commit slots)
     integer cm_i;
     reg [3:0] commit_slot;
@@ -3287,7 +3388,9 @@ module store_queue(
                 sq_addr_base_ready[i] <= 0;
                 sq_data_ready[i] <= 0;
                 sq_addr_computed[i] <= 0;
+                lh_valid[i] <= 0;
             end
+            lh_wr_ptr <= 4'd0;
             age_counter <= 0;
             rob_store_addr_ready <= 0;
             rob_store_data_ready <= 0;
@@ -3297,6 +3400,11 @@ module store_queue(
             rob_store_addr_ready <= 0;
             rob_store_data_ready <= 0;
             rob_store_addr_value <= 64'd0;
+
+            if (flush || br_squash) begin
+                for (i = 0; i < NUM_ENTRIES; i = i + 1)
+                    lh_valid[i] <= 0;
+            end
 
             // Selective branch squash: kill only entries younger than the mispredicted branch
             if (br_squash) begin
@@ -3372,6 +3480,17 @@ module store_queue(
             if (commit_found) begin
                 sq_valid[commit_slot] <= 0;
             end
+
+            // Track executed loads for violation learning.
+            if (load_exec_valid && !flush) begin
+                lh_valid[lh_wr_ptr] <= 1'b1;
+                lh_addr[lh_wr_ptr] <= load_exec_addr;
+                lh_rob_idx[lh_wr_ptr] <= load_exec_rob_idx;
+                lh_pc_idx[lh_wr_ptr] <= load_exec_pc_idx;
+                lh_wr_ptr <= lh_wr_ptr + 4'd1;
+            end
+            if (violation_found)
+                lh_valid[violation_lh_slot] <= 1'b0;
 
             // Dispatch
             if (dispatch_en && free_found) begin
