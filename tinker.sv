@@ -458,7 +458,9 @@ module tinker_core(
     wire slot2_singleq_conflict =
         ((is_load1 || is_return1) && (is_load2 || is_return2)) ||
         ((is_store1_only || is_call1) && (is_store2_only || is_call2));
-    wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 && (is_branch1 || is_return1 || is_branch2 || is_return2);
+    wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 &&
+                                 ((is_branch1 || is_return1) ||
+                                  ((is_branch2 || is_return2) && rob_has_unresolved_branch));
     wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
 
     assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 ||
@@ -742,6 +744,10 @@ module tinker_core(
         (opcode2 == 5'h0a) ? (fu_out_pc2 + imm2) :
                               src1_val2;
     wire branch_pred2 = dispatch_valid2 && is_branch2 && branch2_target_ready && !branch_pred1;
+    wire branch1_pre_resolve = dispatch_valid1 && is_branch1 && branch1_target_ready &&
+                               (opcode1 == 5'h08 || opcode1 == 5'h09 || opcode1 == 5'h0a || opcode1 == 5'h0c);
+    wire branch2_pre_resolve = dispatch_valid2 && is_branch2 && branch2_target_ready &&
+                               (opcode2 == 5'h08 || opcode2 == 5'h09 || opcode2 == 5'h0a || opcode2 == 5'h0c);
     wire pred_redirect = branch_pred1 || branch_pred2;
     wire [63:0] pred_redirect_pc = branch_pred1 ? branch1_pred_target : branch2_pred_target;
 
@@ -749,8 +755,8 @@ module tinker_core(
     // Snapshot ID management for branch RAT checkpoints
     // ================================================================
     wire [1:0] snap_id1 = snap_pick_id1;
-    wire take_snap1 = dispatch_valid1 && (is_branch1 || is_return1);
-    wire take_snap2 = dispatch_valid2 && (is_branch2 || is_return2);
+    wire take_snap1 = dispatch_valid1 && ((is_branch1 && !branch1_pre_resolve) || is_return1);
+    wire take_snap2 = dispatch_valid2 && ((is_branch2 && !branch2_pre_resolve) || is_return2);
     wire [3:0] snap_in_use_after_slot1 = take_snap1 ?
                                          (snap_in_use | (4'b0001 << snap_id1)) :
                                          snap_in_use;
@@ -834,6 +840,28 @@ module tinker_core(
                 if (snap_in_use[2] && snap_owner_rob[2] == br_rob_idx_combined)
                     snap_in_use[2] <= 1'b0;
                 if (snap_in_use[3] && snap_owner_rob[3] == br_rob_idx_combined)
+                    snap_in_use[3] <= 1'b0;
+            end
+            // Also free on branch commit. This covers deterministic pre-resolved branches
+            // that may not emit a later br_resolved pulse from execution.
+            if (rob_commit_en1 && rob_commit_type1 == ITYPE_BRANCH) begin
+                if (snap_in_use[0] && snap_owner_rob[0] == rob_commit_rob_idx1)
+                    snap_in_use[0] <= 1'b0;
+                if (snap_in_use[1] && snap_owner_rob[1] == rob_commit_rob_idx1)
+                    snap_in_use[1] <= 1'b0;
+                if (snap_in_use[2] && snap_owner_rob[2] == rob_commit_rob_idx1)
+                    snap_in_use[2] <= 1'b0;
+                if (snap_in_use[3] && snap_owner_rob[3] == rob_commit_rob_idx1)
+                    snap_in_use[3] <= 1'b0;
+            end
+            if (rob_commit_en2 && rob_commit_type2 == ITYPE_BRANCH) begin
+                if (snap_in_use[0] && snap_owner_rob[0] == rob_commit_rob_idx2)
+                    snap_in_use[0] <= 1'b0;
+                if (snap_in_use[1] && snap_owner_rob[1] == rob_commit_rob_idx2)
+                    snap_in_use[1] <= 1'b0;
+                if (snap_in_use[2] && snap_owner_rob[2] == rob_commit_rob_idx2)
+                    snap_in_use[2] <= 1'b0;
+                if (snap_in_use[3] && snap_owner_rob[3] == rob_commit_rob_idx2)
                     snap_in_use[3] <= 1'b0;
             end
 
@@ -1393,6 +1421,7 @@ module tinker_core(
         .alloc_pc1(fu_out_pc1),
         .alloc_branch_pred1(branch_pred1),
         .alloc_branch_target1(branch1_pred_target),
+        .alloc_branch_pre_resolved1(branch1_pre_resolve),
         .alloc_epoch1(dispatch_epoch),
         .alloc_snap_id1(snap_id1),
         .alloc_idx1(rob_alloc_idx1),
@@ -1404,6 +1433,7 @@ module tinker_core(
         .alloc_pc2(fu_out_pc2),
         .alloc_branch_pred2(branch_pred2),
         .alloc_branch_target2(branch2_pred_target),
+        .alloc_branch_pre_resolved2(branch2_pre_resolve),
         .alloc_epoch2(dispatch_epoch),
         .alloc_snap_id2(snap_id2),
         .alloc_idx2(rob_alloc_idx2),
@@ -1479,6 +1509,8 @@ module tinker_core(
     wire fpu1_cdb_valid_masked = fpu1_cdb_valid && !kill_fpu1_cdb;
 
     cdb_arbiter cdb_arb(
+        .clk(clk),
+        .rst(reset),
         .alu0_valid(alu0_cdb_valid_masked),
         .alu0_tag(alu0_cdb_tag),
         .alu0_value(alu0_cdb_value),
@@ -3378,6 +3410,7 @@ module rob(
     input  wire [63:0] alloc_pc1,
     input  wire        alloc_branch_pred1,
     input  wire [63:0] alloc_branch_target1,
+    input  wire        alloc_branch_pre_resolved1,
     input  wire [2:0]  alloc_epoch1,
     input  wire [1:0]  alloc_snap_id1,
     output wire [4:0]  alloc_idx1,
@@ -3391,6 +3424,7 @@ module rob(
     input  wire [63:0] alloc_pc2,
     input  wire        alloc_branch_pred2,
     input  wire [63:0] alloc_branch_target2,
+    input  wire        alloc_branch_pre_resolved2,
     input  wire [2:0]  alloc_epoch2,
     input  wire [1:0]  alloc_snap_id2,
     output wire [4:0]  alloc_idx2,
@@ -3732,7 +3766,7 @@ module rob(
             // Suppress alloc when mispredict detected this cycle
             if (alloc_en1 && !this_cycle_flush) begin
                 valid[tail] <= 1;
-                complete[tail] <= 0;
+                complete[tail] <= alloc_branch_pre_resolved1;
                 itype[tail] <= alloc_type1;
                 arch_rd[tail] <= alloc_arch_rd1;
                 old_phys[tail] <= alloc_old_phys1;
@@ -3742,14 +3776,16 @@ module rob(
                 branch_target_pred[tail] <= alloc_branch_target1;
                 entry_epoch[tail] <= alloc_epoch1;
                 snap_id[tail] <= alloc_snap_id1;
-                branch_resolved_flag[tail] <= 0;
+                branch_resolved_flag[tail] <= alloc_branch_pre_resolved1;
+                branch_actual_taken[tail] <= alloc_branch_pre_resolved1;
+                branch_actual_target[tail] <= alloc_branch_target1;
                 store_addr_rdy[tail] <= 0;
                 store_data_rdy[tail] <= 0;
                 alloc_count = alloc_count + 6'd1;
 
                 if (alloc_en2) begin
                     valid[tail + 5'd1] <= 1;
-                    complete[tail + 5'd1] <= 0;
+                    complete[tail + 5'd1] <= alloc_branch_pre_resolved2;
                     itype[tail + 5'd1] <= alloc_type2;
                     arch_rd[tail + 5'd1] <= alloc_arch_rd2;
                     old_phys[tail + 5'd1] <= alloc_old_phys2;
@@ -3759,7 +3795,9 @@ module rob(
                     branch_target_pred[tail + 5'd1] <= alloc_branch_target2;
                     entry_epoch[tail + 5'd1] <= alloc_epoch2;
                     snap_id[tail + 5'd1] <= alloc_snap_id2;
-                    branch_resolved_flag[tail + 5'd1] <= 0;
+                    branch_resolved_flag[tail + 5'd1] <= alloc_branch_pre_resolved2;
+                    branch_actual_taken[tail + 5'd1] <= alloc_branch_pre_resolved2;
+                    branch_actual_target[tail + 5'd1] <= alloc_branch_target2;
                     store_addr_rdy[tail + 5'd1] <= 0;
                     store_data_rdy[tail + 5'd1] <= 0;
                     alloc_count = alloc_count + 6'd1;
@@ -3897,9 +3935,12 @@ module fetch_unit(
 endmodule
 
 // ============================================================
-// Task 12: CDB Arbiter (combinational)
+// Task 12: CDB Arbiter
 // ============================================================
 module cdb_arbiter(
+    input  wire        clk,
+    input  wire        rst,
+
     // Producer inputs - ALU pipe 0
     input  wire        alu0_valid,
     input  wire [6:0]  alu0_tag,
@@ -3964,10 +4005,50 @@ module cdb_arbiter(
     output wire        lsu1_stall
 );
 
-    // Bus 0 priority: alu0 > fpu0 > lsu0
-    wire bus0_sel_alu0 = alu0_valid;
-    wire bus0_sel_fpu0 = fpu0_valid && !alu0_valid;
-    wire bus0_sel_lsu0 = lsu0_valid && !alu0_valid && !fpu0_valid;
+    // Bus 0 fair arbitration: round-robin across ALU0/FPU0/LSU0.
+    // Pointer encoding:
+    //   0 -> ALU0 has first priority this cycle
+    //   1 -> FPU0 has first priority this cycle
+    //   2 -> LSU0 has first priority this cycle
+    reg [1:0] bus0_rr_ptr;
+    reg bus0_sel_alu0;
+    reg bus0_sel_fpu0;
+    reg bus0_sel_lsu0;
+
+    always @(*) begin
+        bus0_sel_alu0 = 1'b0;
+        bus0_sel_fpu0 = 1'b0;
+        bus0_sel_lsu0 = 1'b0;
+        case (bus0_rr_ptr)
+            2'd0: begin
+                if (alu0_valid) bus0_sel_alu0 = 1'b1;
+                else if (fpu0_valid) bus0_sel_fpu0 = 1'b1;
+                else if (lsu0_valid) bus0_sel_lsu0 = 1'b1;
+            end
+            2'd1: begin
+                if (fpu0_valid) bus0_sel_fpu0 = 1'b1;
+                else if (lsu0_valid) bus0_sel_lsu0 = 1'b1;
+                else if (alu0_valid) bus0_sel_alu0 = 1'b1;
+            end
+            default: begin // 2'd2 and any invalid state
+                if (lsu0_valid) bus0_sel_lsu0 = 1'b1;
+                else if (alu0_valid) bus0_sel_alu0 = 1'b1;
+                else if (fpu0_valid) bus0_sel_fpu0 = 1'b1;
+            end
+        endcase
+    end
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            bus0_rr_ptr <= 2'd0;
+        end else if (bus0_sel_alu0) begin
+            bus0_rr_ptr <= 2'd1;
+        end else if (bus0_sel_fpu0) begin
+            bus0_rr_ptr <= 2'd2;
+        end else if (bus0_sel_lsu0) begin
+            bus0_rr_ptr <= 2'd0;
+        end
+    end
 
     assign cdb0_valid = alu0_valid || fpu0_valid || lsu0_valid;
     assign cdb0_tag   = bus0_sel_alu0 ? alu0_tag   : (bus0_sel_fpu0 ? fpu0_tag   : lsu0_tag);
@@ -3987,9 +4068,9 @@ module cdb_arbiter(
     assign cdb1_epoch = bus1_sel_alu1 ? alu1_epoch : (bus1_sel_fpu1 ? fpu1_epoch : 3'd0);
 
     // Stall signals: producer is valid but didn't get the bus
-    assign alu0_stall = 1'b0;  // alu0 always wins bus 0
-    assign fpu0_stall = fpu0_valid && alu0_valid;
-    assign lsu0_stall = lsu0_valid && (alu0_valid || fpu0_valid);
+    assign alu0_stall = alu0_valid && !bus0_sel_alu0;
+    assign fpu0_stall = fpu0_valid && !bus0_sel_fpu0;
+    assign lsu0_stall = lsu0_valid && !bus0_sel_lsu0;
 
     assign alu1_stall = 1'b0;  // alu1 always wins bus 1
     assign fpu1_stall = fpu1_valid && alu1_valid;
