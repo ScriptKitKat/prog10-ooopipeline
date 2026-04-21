@@ -53,6 +53,7 @@ module tinker_core(
     wire [4:0]  rob_mispredict_rob_idx;
     wire [1:0]  rob_mispredict_snap_id;
     wire        rob_has_unresolved_branch;
+    wire [4:0]  rob_head_idx;
     wire        rob_commit_en1, rob_commit_en2;
     wire [2:0]  rob_commit_type1, rob_commit_type2;
     wire [4:0]  rob_commit_arch_rd1, rob_commit_arch_rd2;
@@ -133,6 +134,7 @@ module tinker_core(
     wire        lq_full;
     wire        lq_mem_read_en;
     wire [63:0] lq_mem_read_addr;
+    wire [4:0]  lq_mem_read_rob_idx;
     wire [63:0] lq_mem_read_data;
     wire        lq_cdb_valid;
     wire [6:0]  lq_cdb_tag;
@@ -459,8 +461,7 @@ module tinker_core(
         ((is_load1 || is_return1) && (is_load2 || is_return2)) ||
         ((is_store1_only || is_call1) && (is_store2_only || is_call2));
     wire slot2_branch_conflict = fu_out_valid1 && fu_out_valid2 &&
-                                 ((is_branch1 || is_return1) ||
-                                  ((is_branch2 || is_return2) && rob_has_unresolved_branch));
+                                 (is_branch1 || is_return1);
     wire slot2_blocked = target_full2 || slot2_singleq_conflict || slot2_branch_conflict;
 
     assign decode_stall = !rob_can_alloc2 || !fl_can_alloc2 ||
@@ -1334,6 +1335,7 @@ module tinker_core(
         .cdb1_valid(cdb1_valid), .cdb1_tag(cdb1_tag), .cdb1_value(cdb1_value),
         .mem_read_en(lq_mem_read_en),
         .mem_read_addr(lq_mem_read_addr),
+        .mem_read_rob_idx(lq_mem_read_rob_idx),
         .mem_read_data(lq_mem_read_data_wire),
         .sq_fwd_valid(sq_fwd_hit),
         .sq_fwd_data(sq_fwd_data),
@@ -1381,6 +1383,8 @@ module tinker_core(
         .mem_write_data(sq_mem_write_data),
         .fwd_check_en(lq_mem_read_en),
         .fwd_check_addr(lq_mem_read_addr),
+        .fwd_check_rob_idx(lq_mem_read_rob_idx),
+        .rob_head_idx(rob_head_idx),
         .fwd_hit(sq_fwd_hit),
         .fwd_data(sq_fwd_data),
         .rob_store_addr_ready(sq_rob_store_addr_ready),
@@ -1446,6 +1450,7 @@ module tinker_core(
         .mispredict_snap_id(rob_mispredict_snap_id),
         .flush_all(rob_flush_all),
         .has_unresolved_branch(rob_has_unresolved_branch),
+        .head_idx(rob_head_idx),
         .commit_en1(rob_commit_en1),
         .commit_type1(rob_commit_type1),
         .commit_arch_rd1(rob_commit_arch_rd1),
@@ -2844,6 +2849,7 @@ module load_queue(
     // Memory read port
     output reg mem_read_en,
     output reg [63:0] mem_read_addr,
+    output wire [4:0] mem_read_rob_idx,
     input [63:0] mem_read_data,
 
     // Store-to-load forwarding
@@ -2960,6 +2966,7 @@ module load_queue(
         mem_read_en = read_found;
         mem_read_addr = read_found ? lq_addr[read_slot] : 64'd0;
     end
+    assign mem_read_rob_idx = read_found ? lq_rob_idx[read_slot] : 5'd0;
 
     // Find oldest done entry to output on CDB
     integer ci;
@@ -3129,6 +3136,8 @@ module store_queue(
     // Store-to-load forwarding
     input fwd_check_en,
     input [63:0] fwd_check_addr,
+    input [4:0] fwd_check_rob_idx,
+    input [4:0] rob_head_idx,
     output reg fwd_hit,
     output reg [63:0] fwd_data,
 
@@ -3209,17 +3218,27 @@ module store_queue(
 
     // Store-to-load forwarding (combinational)
     // Forward from any live store whose address and data are both known. We prefer the
-    // youngest matching entry because it is the value most recently written to that address.
+    // youngest matching *older* entry so loads never consume values from younger stores.
     integer fwd_i;
+    reg [4:0] fwd_load_dist;
+    reg [4:0] fwd_store_dist;
+    reg [4:0] fwd_best_dist;
     always @(*) begin
         fwd_hit = 0;
         fwd_data = 64'd0;
+        fwd_load_dist = fwd_check_rob_idx - rob_head_idx;
+        fwd_best_dist = 5'd0;
         if (fwd_check_en && !flush) begin
             for (fwd_i = 0; fwd_i < NUM_ENTRIES; fwd_i = fwd_i + 1) begin
+                fwd_store_dist = sq_rob_idx[fwd_i] - rob_head_idx;
                 if (sq_valid[fwd_i] && sq_addr_computed[fwd_i] &&
-                    sq_data_ready[fwd_i] && sq_addr[fwd_i] == fwd_check_addr) begin
-                    fwd_hit = 1;
-                    fwd_data = sq_data_val[fwd_i];
+                    sq_data_ready[fwd_i] && sq_addr[fwd_i] == fwd_check_addr &&
+                    (fwd_store_dist < fwd_load_dist)) begin
+                    if (!fwd_hit || (fwd_store_dist > fwd_best_dist)) begin
+                        fwd_hit = 1;
+                        fwd_data = sq_data_val[fwd_i];
+                        fwd_best_dist = fwd_store_dist;
+                    end
                 end
             end
         end
@@ -3477,6 +3496,7 @@ module rob(
     // Status
     output wire        can_alloc2,
     output wire        has_unresolved_branch,
+    output wire [4:0]  head_idx,
     output reg         halt_committed,
 
     // Recovery tail (old tail before truncation, for selective squash)
@@ -3522,6 +3542,7 @@ module rob(
     assign alloc_idx2 = tail + 5'd1;
     assign can_alloc2 = (count <= 6'd30);
     assign has_unresolved_branch = unresolved_branch_pending;
+    assign head_idx = head;
     always @(*) begin
         unresolved_branch_pending = 1'b0;
         for (ub_i = 0; ub_i < DEPTH; ub_i = ub_i + 1) begin
